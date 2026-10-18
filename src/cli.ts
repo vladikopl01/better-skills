@@ -67,7 +67,7 @@ function showBanner(): void {
   console.log(`${DIM}The open agent skills ecosystem${RESET}`);
   console.log();
   console.log(
-    `  ${DIM}$${RESET} ${TEXT}npx skills add ${DIM}<package>${RESET}        ${DIM}Add a new skill${RESET}`
+    `  ${DIM}$${RESET} ${TEXT}npx skills add ${DIM}[package]${RESET}        ${DIM}Browse and install skills${RESET}`
   );
   console.log(
     `  ${DIM}$${RESET} ${TEXT}npx skills use ${DIM}<package>@<skill>${RESET} ${DIM}Use a skill without installing${RESET}`
@@ -107,7 +107,7 @@ function showHelp(): void {
 ${BOLD}Usage:${RESET} skills <command> [options]
 
 ${BOLD}Manage Skills:${RESET}
-  add <package>        Add a skill package (alias: a)
+  add [package]        Add skills, or browse skills without a package (alias: a)
                        e.g. vercel-labs/agent-skills
                             notion
                             https://notion.so/<skill-page>
@@ -117,6 +117,7 @@ ${BOLD}Manage Skills:${RESET}
   remove [skills]      Remove installed skills
   list, ls             List installed skills
   find [query]         Search for skills interactively
+  like [package]       Like skills without installing them
 
 ${BOLD}Find Options:${RESET}
   --owner <owner>        Search only repositories from a GitHub owner
@@ -144,8 +145,15 @@ ${BOLD}Add Options:${RESET}
   --metadata <json>      Attach valid JSON to the install telemetry event
   --subagent <names>     Install to Eve subagents (use 'root' for the root agent)
   --all                  Shorthand for --skill '*' --agent '*' -y
+  --liked                Start with liked skills (without a package)
   --full-depth           Search all subdirectories even when a root SKILL.md exists
-  --json                 Output results as JSON (machine-readable, no ANSI codes)
+  --json                 Output source-install results as JSON (requires a package)
+
+${BOLD}Like Options:${RESET}
+  -s, --skill <skills>   Select skill names (use '*' for all skills)
+  --remove               Remove likes
+  -y, --yes              Select all skills from the source without prompting
+  --full-depth           Search all subdirectories of the source
 
 ${BOLD}Use Options:${RESET}
   -s, --skill <skill>    Specify the skill to use
@@ -174,13 +182,19 @@ ${BOLD}List Options:${RESET}
   -g, --global           List global skills (default: project)
   -a, --agent <agents>   Filter by specific agents
   --json                 Output as JSON (machine-readable, no ANSI codes)
+  --saved                List saved skills, likes, and installation counts
+  --liked                Filter saved skills to liked ones (with --saved)
 
 ${BOLD}Options:${RESET}
   --help, -h        Show this help message
   --version, -v     Show version number
 
 ${BOLD}Examples:${RESET}
+  ${DIM}$${RESET} skills add                            ${DIM}# search, liked, popular, and your most installed${RESET}
+  ${DIM}$${RESET} skills add --liked
   ${DIM}$${RESET} skills add vercel-labs/agent-skills
+  ${DIM}$${RESET} skills like vercel-labs/agent-skills --skill web-design-guidelines
+  ${DIM}$${RESET} skills list --saved
   ${DIM}$${RESET} skills use vercel-labs/agent-skills@vercel-optimize | claude
   ${DIM}$${RESET} skills use vercel-labs/agent-skills --skill vercel-optimize --agent claude-code
   ${DIM}$${RESET} skills add vercel-labs/agent-skills -g
@@ -341,6 +355,11 @@ async function main(): Promise<void> {
   }
 
   switch (command) {
+    case 'like': {
+      const { runLike } = await import('./saved-skills.ts');
+      await runLike(restArgs);
+      break;
+    }
     case 'find':
     case 'search':
     case 'f':

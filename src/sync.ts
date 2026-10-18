@@ -804,6 +804,7 @@ export async function runSync(args: string[], options: SyncOptions = {}): Promis
   for (const request of remoteRequests) {
     const label = getProjectLockSource(request.parsed);
     const result = await installFromSource(request.parsed, {
+      reason: 'maintenance',
       skills: request.skills,
       agents: targetAgents,
       via: request.via,

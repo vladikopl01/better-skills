@@ -20,6 +20,25 @@ Supports **OpenCode**, **Claude Code**, **Codex**, **Cursor**, and [75 more](#su
 npx skills add vercel-labs/agent-skills
 ```
 
+Run without a package to browse skills interactively:
+
+```bash
+npx skills add
+```
+
+| Tab                 | Description                                                   |
+| ------------------- | ------------------------------------------------------------- |
+| Search              | Search skills on [skills.sh](https://skills.sh)               |
+| Liked               | Skills you have liked, available across projects              |
+| Most installed      | Top skills by all-time installs on skills.sh                  |
+| Your most installed | Skills sorted by your installation count, then alphabetically |
+
+Use **Tab** to switch tabs, **↑/↓** to navigate, **Space** to select or deselect, and **Enter** to install the highlighted skill or your selection. Search results have 20 skills per page; **Ctrl+P** goes to the previous page and **Ctrl+N** to the next. Press **Ctrl+L** to like or unlike the highlighted skill, including search results. Likes are saved immediately without installing. **Esc** cancels.
+
+Each row shows the source, installation count, and current project/global installation status. Press **Ctrl+D** to read the highlighted skill's `SKILL.md`; **↑/↓** scrolls and **Esc** returns to the list. Previewing a skill does not install it or change its installation count.
+
+Each tab remembers its search and position. Selections carry across pages, searches, and tabs. Installation settings apply once to the selection; failed installations can be retried. Passing a package uses the usual source installation flow.
+
 ## Use a Skill Without Installing
 
 Generate a prompt for one skill, or start a supported coding agent interactively:
@@ -91,6 +110,7 @@ For GitHub tree lookups, `skills` first tries the API anonymously, then an expli
 | `--copy`                  | Copy files instead of symlinking to agent directories                                                                                              |
 | `-y, --yes`               | Skip all confirmation prompts                                                                                                                      |
 | `--all`                   | Install all skills to all agents without prompts                                                                                                   |
+| `--liked`                 | Open liked skills when no package is provided; with `-y`, install all liked skills                                                                 |
 
 ### Examples
 
@@ -147,6 +167,7 @@ When installing interactively, you can choose:
 | ---------------------------- | --------------------------------------------- |
 | `npx skills use <source>`    | Use one skill without installing              |
 | `npx skills list`            | List installed skills (alias: `ls`)           |
+| `npx skills like [source]`   | Like skills without installing them           |
 | `npx skills find [query]`    | Search for skills interactively or by keyword |
 | `npx skills remove [skills]` | Remove installed skills from agents           |
 | `npx skills update [skills]` | Update installed skills to latest versions    |
@@ -165,7 +186,32 @@ npx skills ls -g
 
 # Filter by specific agents
 npx skills ls -a claude-code -a cursor
+
+# List saved skills and your installation counts
+npx skills list --saved
+npx skills list --saved --liked --json
 ```
+
+Saved skills include likes and installation history. Counts start at zero and increase once per explicit installation after every requested target succeeds. Reinstalls count again; updates, dependency sync, failures, and no-ops do not. Removing a skill preserves its likes and history.
+
+Saved data stays on your machine at `$XDG_STATE_HOME/skills-cli/personal.json`, or `~/.agents/skills-cli/personal.json` when `XDG_STATE_HOME` is unset. Existing installations are not imported into this history.
+
+### `skills like`
+
+Save skills for later without installing them.
+
+```bash
+# Like a skill from a source
+npx skills like vercel-labs/agent-skills --skill web-design-guidelines
+
+# Remove a like from a saved skill
+npx skills like --skill web-design-guidelines --remove
+
+# Install all liked skills without prompts
+npx skills add --liked -a codex -y
+```
+
+Omit the source to choose from saved skills. Use `--skill <names>` to select by name or `-y` to like every skill from a source.
 
 ### `skills find`
 

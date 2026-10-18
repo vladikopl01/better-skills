@@ -1,8 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { stripVTControlCharacters } from 'node:util';
-import { cancelSymbol, searchMultiselect } from '../src/prompts/search-multiselect.ts';
+import { cancelSymbol, searchMultiselect, wrapText } from '../src/prompts/search-multiselect.ts';
 
 describe('searchMultiselect rendering', () => {
+  it('wraps instructions without losing indentation or stalling on wide characters', () => {
+    expect(wrapText('    npm run build', 40)).toEqual(['    npm run build']);
+    expect(wrapText('界😀a', 1)).toEqual(['…', '…', 'a']);
+  });
+
   it('redraws the prompt in one terminal write after navigation', async () => {
     const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
 

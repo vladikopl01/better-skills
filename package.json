@@ -1,4 +1,5 @@
 {
+  "private": true,
   "name": "skills",
   "version": "1.7.2",
   "description": "The open agent skills ecosystem",

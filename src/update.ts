@@ -58,9 +58,9 @@ export interface UpdateCheckOptions {
  */
 function getUpdateChildEnv(sourceType: string): NodeJS.ProcessEnv | undefined {
   if (sourceType !== 'github') {
-    return undefined;
+    return { ...process.env, SKILLS_CLI_INSTALL_REASON: 'maintenance' };
   }
-  return { ...process.env, GH_HOST: 'github.com' };
+  return { ...process.env, GH_HOST: 'github.com', SKILLS_CLI_INSTALL_REASON: 'maintenance' };
 }
 
 export function parseUpdateOptions(args: string[]): UpdateCheckOptions {
@@ -477,6 +477,7 @@ export async function processWellKnownUpdates(
           stdio: ['inherit', 'pipe', 'pipe'],
           encoding: 'utf-8',
           shell: false,
+          env: getUpdateChildEnv('well-known'),
         }
       );
 

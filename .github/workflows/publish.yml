@@ -13,6 +13,8 @@ on:
 
 jobs:
   publish:
+    # Choose fork release names before enabling publication.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     environment: npm-publish
     permissions:

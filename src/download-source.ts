@@ -30,6 +30,7 @@ export interface DownloadedSource {
 }
 
 export interface DownloadSourceOptions {
+  signal?: AbortSignal;
   downloadMaxBytes?: number;
   extractMaxBytes?: number;
   extractMaxFiles?: number;
@@ -96,10 +97,13 @@ function incrementEntry(state: ExtractState, size: number, limits: DownloadLimit
 async function downloadToFile(
   url: string,
   targetFile: string,
-  limits: DownloadLimits
+  limits: DownloadLimits,
+  signal?: AbortSignal
 ): Promise<void> {
   const response = await fetch(url, {
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)])
+      : AbortSignal.timeout(FETCH_TIMEOUT_MS),
     redirect: 'follow',
   });
 
@@ -134,7 +138,9 @@ async function downloadToFile(
     },
   });
 
-  await pipeline(response.body.pipeThrough(limitStream), createWriteStream(targetFile));
+  await pipeline(response.body.pipeThrough(limitStream), createWriteStream(targetFile), {
+    signal,
+  });
 }
 
 async function isValidSkillMarkdown(filePath: string): Promise<boolean> {
@@ -150,21 +156,24 @@ async function isValidSkillMarkdown(filePath: string): Promise<boolean> {
 async function extractZip(
   filePath: string,
   extractDir: string,
-  limits: DownloadLimits
+  limits: DownloadLimits,
+  signal?: AbortSignal
 ): Promise<void> {
+  signal?.throwIfAborted();
   const files = readZipArchive(await readFile(filePath), {
     maxExtractedBytes: limits.extractMaxBytes,
     maxEntries: limits.extractMaxFiles,
   });
 
   for (const [path, contents] of files) {
+    signal?.throwIfAborted();
     const targetPath = join(extractDir, path);
     if (!isPathSafe(extractDir, targetPath)) {
       throw new ArchiveValidationError(`Archive contains unsafe path: ${path}`);
     }
 
     await mkdir(dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, contents);
+    await writeFile(targetPath, contents, { signal });
   }
 }
 
@@ -185,15 +194,17 @@ function isTarEntryFile(entry: tar.ReadEntry | Stats): boolean {
 async function extractTar(
   filePath: string,
   extractDir: string,
-  limits: DownloadLimits
+  limits: DownloadLimits,
+  signal?: AbortSignal
 ): Promise<void> {
+  signal?.throwIfAborted();
   const state: ExtractState = { bytes: 0, entries: 0 };
   let validationError: ArchiveValidationError | undefined;
 
   await tar.x({
     strict: true,
     filter(entryPath, entry) {
-      if (validationError) return false;
+      if (validationError || signal?.aborted) return false;
 
       try {
         const safePath = validateArchivePath(entryPath);
@@ -227,6 +238,7 @@ async function extractTar(
     file: filePath,
   });
 
+  signal?.throwIfAborted();
   if (validationError) {
     throw validationError;
   }
@@ -235,7 +247,8 @@ async function extractTar(
 async function tryExtractArchive(
   filePath: string,
   extractDir: string,
-  limits: DownloadLimits
+  limits: DownloadLimits,
+  signal?: AbortSignal
 ): Promise<boolean> {
   const header = await readFile(filePath).then((buffer) => buffer.subarray(0, 512));
   const isZip = header[0] === 0x50 && header[1] === 0x4b;
@@ -243,19 +256,20 @@ async function tryExtractArchive(
 
   try {
     if (isZip) {
-      await extractZip(filePath, extractDir, limits);
+      await extractZip(filePath, extractDir, limits, signal);
       return true;
     }
 
     if (isGzip) {
-      await extractTar(filePath, extractDir, limits);
+      await extractTar(filePath, extractDir, limits, signal);
       return true;
     }
 
-    await extractTar(filePath, extractDir, limits);
+    await extractTar(filePath, extractDir, limits, signal);
     return true;
   } catch (error) {
     await rm(extractDir, { recursive: true, force: true }).catch(() => {});
+    signal?.throwIfAborted();
     await mkdir(extractDir, { recursive: true });
     if (error instanceof ArchiveValidationError) {
       throw error;
@@ -282,7 +296,8 @@ export async function downloadSource(
   const extractDir = join(tempDir, 'extract');
 
   try {
-    await downloadToFile(url, downloadedFile, limits);
+    await downloadToFile(url, downloadedFile, limits, options.signal);
+    options.signal?.throwIfAborted();
 
     const downloadedStats = await stat(downloadedFile);
     if (downloadedStats.size === 0) {
@@ -290,15 +305,20 @@ export async function downloadSource(
     }
 
     if (await isValidSkillMarkdown(downloadedFile)) {
+      options.signal?.throwIfAborted();
       const skillDir = join(tempDir, 'skill');
       await mkdir(skillDir, { recursive: true });
-      await writeFile(join(skillDir, 'SKILL.md'), await readFile(downloadedFile));
+      await writeFile(join(skillDir, 'SKILL.md'), await readFile(downloadedFile), {
+        signal: options.signal,
+      });
+      options.signal?.throwIfAborted();
       return { rootDir: skillDir, tempDir, kind: 'skill-md' };
     }
 
     await mkdir(extractDir, { recursive: true });
-    if (await tryExtractArchive(downloadedFile, extractDir, limits)) {
+    if (await tryExtractArchive(downloadedFile, extractDir, limits, options.signal)) {
       const rootDir = (await getSingleTopLevelDirectory(extractDir)) ?? extractDir;
+      options.signal?.throwIfAborted();
       return { rootDir, tempDir, kind: 'archive' };
     }
 

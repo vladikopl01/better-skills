@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as tar from 'tar';
@@ -58,6 +58,44 @@ description: A skill served as a bare markdown download
     expect(skills[0]!.name).toBe('direct-url-skill');
 
     rmSync(downloaded.tempDir, { recursive: true, force: true });
+  });
+
+  it('cancels a streaming download and removes its temporary files', async () => {
+    for (const name of ['TMPDIR', 'TMP', 'TEMP']) vi.stubEnv(name, testDir);
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    let started!: () => void;
+    const streaming = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream({
+              start(stream) {
+                stream.enqueue(new TextEncoder().encode('partial download'));
+              },
+              pull() {
+                started();
+              },
+              cancel,
+            })
+          )
+      )
+    );
+
+    const download = downloadSource('https://internal.example.com/download', {
+      signal: controller.signal,
+    });
+    const rejection = expect(download).rejects.toMatchObject({ name: 'AbortError' });
+    await streaming;
+    controller.abort();
+    await rejection;
+
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(readdirSync(testDir)).toEqual([]);
   });
 
   it.each([

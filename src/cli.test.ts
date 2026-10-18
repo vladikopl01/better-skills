@@ -10,11 +10,13 @@ describe('skills CLI', () => {
       expect(output).toContain('Usage: skills <command> [options]');
       expect(output).toContain('Manage Skills:');
       expect(output).toContain('init [name]');
-      expect(output).toContain('add <package>');
+      expect(output).toContain('add [package]');
       expect(output).toContain('use <package>@<skill>');
       expect(output).toContain('update');
       expect(output).toContain('Add Options:');
       expect(output).toContain('Use Options:');
+      expect(output).toContain('like [package]');
+      expect(output).toContain('--saved');
       expect(output).toContain('-g, --global');
       expect(output).toContain('-a, --agent');
       expect(output).toContain('-s, --skill');
@@ -96,6 +98,7 @@ describe('skills CLI', () => {
       ['list --help routes to top-level help', 'list'],
       ['init --help routes to top-level help', 'init'],
       ['find --help routes to top-level help', 'find'],
+      ['like --help routes to top-level help', 'like'],
       ['experimental_install --help routes to top-level help', 'experimental_install'],
       ['experimental_sync --help routes to top-level help', 'experimental_sync'],
     ];

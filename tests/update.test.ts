@@ -573,7 +573,11 @@ describe('Update Cleanup Unit Tests', () => {
       expect(argv).toEqual(
         expect.arrayContaining(['add', 'owner/repo/skills/skill-a', '--skill', 'skill-a'])
       );
-      expect((options as { env?: NodeJS.ProcessEnv }).env?.GH_HOST).toBe('github.com');
+      expect((options as { env?: NodeJS.ProcessEnv }).env).toMatchObject({
+        GH_HOST: 'github.com',
+        SKILLS_CLI_INSTALL_REASON: 'maintenance',
+        DISABLE_TELEMETRY: '1',
+      });
     });
 
     it('does not reinterpret generic git shorthands as GitHub during project update', async () => {
@@ -1080,7 +1084,11 @@ describe('Update Cleanup Unit Tests', () => {
       expect(argv).toEqual(
         expect.arrayContaining(['add', 'owner/repo/skills/skill-a', '--skill', 'skill-a'])
       );
-      expect((options as { env?: NodeJS.ProcessEnv }).env?.GH_HOST).toBe('github.com');
+      expect((options as { env?: NodeJS.ProcessEnv }).env).toMatchObject({
+        GH_HOST: 'github.com',
+        SKILLS_CLI_INSTALL_REASON: 'maintenance',
+        DISABLE_TELEMETRY: '1',
+      });
     });
 
     it('keeps GitHub Enterprise updates on their recorded URL and targets one skill', async () => {
@@ -1121,7 +1129,10 @@ describe('Update Cleanup Unit Tests', () => {
           'skill-a',
         ])
       );
-      expect((options as { env?: NodeJS.ProcessEnv }).env).toBeUndefined();
+      expect((options as { env?: NodeJS.ProcessEnv }).env).toMatchObject({
+        GH_HOST: 'github.example.com',
+        SKILLS_CLI_INSTALL_REASON: 'maintenance',
+      });
     });
 
     it('spawns the update without a shell so a crafted ref cannot inject commands', async () => {

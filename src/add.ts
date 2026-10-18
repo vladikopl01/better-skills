@@ -1,4 +1,6 @@
 import * as p from '@clack/prompts';
+import { skillLocator } from './personal-catalog.ts';
+import { recordCompletedSkills, type InstallReason } from './personal-history.ts';
 import pc from 'picocolors';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
@@ -32,7 +34,7 @@ import {
   type AuditResponse,
   type PartnerAudit,
 } from './telemetry.ts';
-import { detectAgent, getAgentType } from './detect-agent.ts';
+import { detectAgent, getAgentType, isRunningInAgent } from './detect-agent.ts';
 import {
   wellKnownProvider,
   computeWellKnownSkillDigest,
@@ -151,7 +153,7 @@ function padEnd(str: string, width: number): string {
  * Render a compact security table showing partner audit results.
  * Returns the lines to display, or empty array if no data.
  */
-function buildSecurityLines(
+export function buildSecurityLines(
   auditData: AuditResponse | null,
   skills: Array<{ slug: string; displayName: string }>,
   source: string
@@ -203,7 +205,7 @@ function buildSecurityLines(
  * Shortens a path for display: replaces homedir with ~ and cwd with .
  * Handles both Unix and Windows path separators.
  */
-function shortenPath(fullPath: string, cwd: string): string {
+export function shortenPath(fullPath: string, cwd: string): string {
   const home = homedir();
   // Ensure we match complete path segments by checking for separator after the prefix
   if (fullPath === home || fullPath.startsWith(home + sep)) {
@@ -290,7 +292,7 @@ function buildAgentSummaryLines(targetAgents: AgentType[], installMode: InstallM
  * the skill installs to the root agent (`agent/skills`). Other agents never set
  * `subagent`.
  */
-interface InstallTarget {
+export interface InstallTarget {
   agent: AgentType;
   subagent?: string;
 }
@@ -302,7 +304,7 @@ function targetDisplayName(target: InstallTarget): string {
 }
 
 /** Stable key used to deduplicate / index per-target state. */
-function targetKey(target: InstallTarget): string {
+export function targetKey(target: InstallTarget): string {
   return target.subagent ? `${target.agent}:${target.subagent}` : target.agent;
 }
 
@@ -354,11 +356,44 @@ function buildTargetSummaryLines(targets: InstallTarget[], installMode: InstallM
   return lines;
 }
 
+/** Share the destination and overwrite summary between source and saved selections. */
+export async function buildSkillSummaryLines(
+  name: string,
+  {
+    installTargets,
+    installGlobally,
+    installMode,
+  }: Pick<InstallSettings, 'installTargets' | 'installGlobally' | 'installMode'>
+): Promise<string[]> {
+  const target = installTargets.length === 1 ? installTargets[0] : undefined;
+  const path = getCanonicalPath(name, {
+    global: installGlobally,
+    agent: target?.agent,
+    eveSubagent: target?.subagent,
+  });
+  const overwrites = await Promise.all(
+    installTargets.map(async (target) =>
+      (await isSkillInstalled(name, target.agent, {
+        global: installGlobally,
+        eveSubagent: target.subagent,
+      }))
+        ? targetDisplayName(target)
+        : null
+    )
+  );
+  const existing = overwrites.filter((name) => name !== null);
+  return [
+    pc.cyan(shortenPath(path, process.cwd())),
+    ...buildTargetSummaryLines(installTargets, installMode),
+    ...(existing.length ? [`  ${pc.yellow('overwrites:')} ${formatList(existing)}`] : []),
+  ];
+}
+
 /**
  * Ensures universal agents are always included in the target agents list.
  * Used when -y flag is passed or when auto-selecting agents.
  */
-function ensureUniversalAgents(targetAgents: AgentType[]): AgentType[] {
+export function ensureUniversalAgents(targetAgents: AgentType[]): AgentType[] {
   const universalAgents = getUniversalAgents();
   const result = [...targetAgents];
 
@@ -565,6 +600,8 @@ const version = packageJson.version;
 setVersion(version);
 
 export interface AddOptions {
+  /** Internal install context; not a public CLI option. */
+  reason?: InstallReason;
   global?: boolean;
   agent?: string[];
   yes?: boolean;
@@ -573,6 +610,8 @@ export interface AddOptions {
   metadata?: string;
   list?: boolean;
   all?: boolean;
+  /** Filter the saved-skill chooser when no source is given. */
+  liked?: boolean;
   fullDepth?: boolean;
   copy?: boolean;
   /**
@@ -948,107 +987,31 @@ async function handleWellKnownSkills(
 
   spinner.start('Installing skills…');
 
-  const results: {
-    skill: string;
-    agent: string;
-    success: boolean;
-    path: string;
-    canonicalPath?: string;
-    mode: InstallMode;
-    symlinkFailed?: boolean;
-    error?: string;
-  }[] = [];
-
-  for (const skill of selectedSkills) {
-    for (const agent of targetAgents) {
-      const result = await installWellKnownSkillForAgent(skill, agent, {
-        global: installGlobally,
-        mode: installMode,
-      });
-      results.push({
-        skill: skill.installName,
-        agent: agents[agent].displayName,
-        ...result,
-      });
-    }
-  }
+  const installTargets = targetAgents.map((agent) => ({ agent }));
+  const results = await installWellKnownToTargets(selectedSkills, installTargets, {
+    global: installGlobally,
+    mode: installMode,
+  });
 
   spinner.stop('Installation complete');
 
   console.log();
   const successful = results.filter((r) => r.success);
   const failed = results.filter((r) => !r.success);
-  const successfulSkillNames = new Set(successful.map((r) => r.skill));
-
-  // Build skillFiles map: { skillName: sourceUrl }
-  const skillFiles: Record<string, string> = {};
-  for (const skill of selectedSkills) {
-    skillFiles[skill.installName] = skill.sourceUrl;
-  }
-
-  // Privacy promise was started before installation — should be resolved by now
-  const isPrivate = await wellKnownPrivacyPromise;
-  if (isPrivate !== true) {
-    track({
-      event: 'install',
-      source: sourceIdentifier,
-      skills: selectedSkills.map((s) => s.installName).join(','),
-      agents: targetAgents.join(','),
-      ...(installGlobally && { global: '1' }),
-      skillFiles: JSON.stringify(skillFiles),
-      installUrl: url,
-      metadata: options.metadata,
-      sourceType: 'well-known',
-    });
-  }
-
-  // Add to skill lock file for update tracking (only for global installs)
-  if (successful.length > 0 && installGlobally) {
-    for (const skill of selectedSkills) {
-      if (successfulSkillNames.has(skill.installName)) {
-        try {
-          await addSkillToLock(skill.installName, {
-            source: sourceIdentifier,
-            sourceType: 'well-known',
-            sourceUrl: skill.sourceUrl,
-            skillFolderHash: '',
-            sourceBaseUrl: url,
-            wellKnownDigest: computeWellKnownSkillDigest(skill),
-          });
-        } catch {
-          // Don't fail installation if lock file update fails
-        }
-      }
-    }
-  }
-
-  // Add to local lock file for project-scoped installs
-  if (successful.length > 0 && !installGlobally) {
-    for (const skill of selectedSkills) {
-      if (successfulSkillNames.has(skill.installName)) {
-        try {
-          const matchingResult = successful.find((r) => r.skill === skill.installName);
-          const installDir = matchingResult?.canonicalPath || matchingResult?.path;
-          if (installDir) {
-            const computedHash = await computeSkillFolderHash(installDir);
-            await addSkillToLocalLock(
-              skill.installName,
-              {
-                source: sourceIdentifier,
-                sourceUrl: url,
-                sourceType: 'well-known',
-                computedHash,
-                wellKnownDigest: computeWellKnownSkillDigest(skill),
-              },
-              cwd
-            );
-          }
-        } catch {
-          // Don't fail installation if lock file update fails
-        }
-      }
-    }
-  }
+  await persistWellKnownInstallation(
+    url,
+    selectedSkills,
+    results,
+    { targetAgents, installGlobally },
+    options,
+    wellKnownPrivacyPromise
+  );
+  await recordCompletedSkills(
+    selectedSkills.map((skill) => skillLocator(source, skill.installName)),
+    installTargets,
+    results,
+    options.reason
+  );
 
   if (successful.length > 0) {
     const bySkill = new Map<string, typeof results>();
@@ -1123,7 +1086,7 @@ async function handleWellKnownSkills(
 
 type Spinner = ReturnType<typeof p.spinner>;
 
-interface ResolvedSkills {
+export interface ResolvedSkills {
   skills: Skill[];
   /** Clone or download root; the caller removes it with cleanup(). */
   tempDir: string | null;
@@ -1134,10 +1097,10 @@ interface ResolvedSkills {
  * Fetch `parsed` (blob snapshot, clone, or download) and discover its skills.
  * Throws instead of exiting; removes its own temp dir when it throws.
  */
-async function resolveSkills(
+export async function resolveSkills(
   parsed: ParsedSource,
-  options: { includeInternal: boolean; fullDepth?: boolean },
-  spinner: Spinner
+  options: { includeInternal: boolean; fullDepth?: boolean; signal?: AbortSignal },
+  spinner: Pick<Spinner, 'start' | 'stop' | 'message'>
 ): Promise<ResolvedSkills> {
   const { includeInternal } = options;
   let skills: Skill[];
@@ -1145,6 +1108,7 @@ async function resolveSkills(
   let tempDir: string | null = null;
 
   try {
+    options.signal?.throwIfAborted();
     if (parsed.type === 'local') {
       spinner.start('Discovering skills…');
       skills = await discoverSkills(parsed.localPath!, parsed.subpath, {
@@ -1153,16 +1117,18 @@ async function resolveSkills(
       });
     } else if (parsed.type === 'well-known' || parsed.type === 'download') {
       spinner.start('Downloading source...');
-      const downloaded = await downloadSource(parsed.url);
+      const downloaded = await downloadSource(parsed.url, { signal: options.signal });
       tempDir = downloaded.tempDir;
       spinner.stop(`Downloaded ${downloaded.kind === 'skill-md' ? 'SKILL.md file' : 'archive'}`);
 
       spinner.start('Discovering skills...');
+      options.signal?.throwIfAborted();
       skills = await discoverSkills(downloaded.rootDir, parsed.subpath, {
         includeInternal,
         fullDepth: options.fullDepth,
       });
-    } else if (parsed.type === 'github' && !options.fullDepth) {
+    } else if (parsed.type === 'github' && !options.fullDepth && !options.signal) {
+      // Cancellable previews use the clone path below; blob discovery has its own timeout.
       // Try the blob-based fast install for GitHub sources; skip for --full-depth.
       // Eligible per repo (a BLOB_ALLOWED_REPOS entry = self-hosted download URL) or
       // per owner (BLOB_ALLOWED_OWNERS = all their repos, skills.sh-hosted).
@@ -1204,17 +1170,21 @@ async function resolveSkills(
         });
       }
     } else {
-      // GitLab, git URL, or --full-depth: always clone
+      // Git sources, --full-depth, and cancellable previews use a clone.
       spinner.start('Cloning repository…');
-      tempDir = await cloneRepo(parsed.url, parsed.ref);
+      tempDir = options.signal
+        ? await cloneRepo(parsed.url, parsed.ref, options.signal)
+        : await cloneRepo(parsed.url, parsed.ref);
       spinner.stop('Repository cloned');
 
       spinner.start('Discovering skills…');
+      options.signal?.throwIfAborted();
       skills = await discoverSkills(tempDir, parsed.subpath, {
         includeInternal,
         fullDepth: options.fullDepth,
       });
     }
+    options.signal?.throwIfAborted();
   } catch (error) {
     await cleanup(tempDir);
     throw error;
@@ -1223,14 +1193,17 @@ async function resolveSkills(
   return { skills, tempDir, blobResult };
 }
 
-type TargetInstallResult = Awaited<ReturnType<typeof installSkillForAgent>> & {
+export type TargetInstallResult = Awaited<ReturnType<typeof installSkillForAgent>> & {
   skill: string;
+  skillName: string;
+  target: InstallTarget;
+  outcome: 'installed' | 'skipped' | 'failed';
   agent: string;
   pluginName?: string;
 };
 
-/** Install every skill into every target. Failures are returned per skill × target. */
-async function installToTargets(
+/** Return target failures; unexpected exceptions propagate unless saved installs opt into retries. */
+export async function installToTargets(
   resolved: ResolvedSkills,
   skills: Skill[],
   targets: InstallTarget[],
@@ -1238,6 +1211,7 @@ async function installToTargets(
     global: boolean;
     mode: InstallMode;
     createMissingAgentRoot: (agent: AgentType) => boolean;
+    continueOnError?: boolean;
   }
 ): Promise<TargetInstallResult[]> {
   const results: TargetInstallResult[] = [];
@@ -1250,25 +1224,33 @@ async function installToTargets(
         eveSubagent: subagent,
         createMissingAgentRoot: options.createMissingAgentRoot(agent),
       };
-      let result;
-      if (resolved.blobResult && 'files' in skill) {
-        // Blob-based install: write files from snapshot
-        const blobSkill = skill as BlobSkill;
-        result = await installBlobSkillForAgent(
-          { installName: blobSkill.name, files: blobSkill.files },
-          agent,
-          installOptions
-        );
-      } else {
-        // Disk-based install: copy from cloned/local directory.
-        // Root-level skills (SKILL.md at repo root, so skill.path === tempDir)
-        // also take this path and are copied recursively (see installer.ts
-        // copyDirectory, which excludes .git), so their scripts/, references/,
-        // assets/, etc. are installed too. See issue #1603.
-        result = await installSkillForAgent(skill, agent, installOptions);
+      let result: Awaited<ReturnType<typeof installSkillForAgent>>;
+      try {
+        if (resolved.blobResult && 'files' in skill) {
+          // Blob-based install: write files from snapshot
+          const blobSkill = skill as BlobSkill;
+          result = await installBlobSkillForAgent(
+            { installName: blobSkill.name, files: blobSkill.files },
+            agent,
+            installOptions
+          );
+        } else {
+          // Disk-based install: copy from cloned/local directory.
+          // Root-level skills (SKILL.md at repo root, so skill.path === tempDir)
+          // also take this path and are copied recursively (see installer.ts
+          // copyDirectory, which excludes .git), so their scripts/, references/,
+          // assets/, etc. are installed too. See issue #1603.
+          result = await installSkillForAgent(skill, agent, installOptions);
+        }
+      } catch (error) {
+        if (!options.continueOnError) throw error;
+        result = { success: false, path: '', mode: options.mode, error: errorMessage(error) };
       }
       results.push({
         skill: getSkillDisplayName(skill),
+        skillName: skill.name,
+        target,
+        outcome: !result.success ? 'failed' : result.skipped ? 'skipped' : 'installed',
         agent: targetDisplayName(target),
         pluginName: skill.pluginName,
         ...result,
@@ -1276,6 +1258,42 @@ async function installToTargets(
     }
   }
   return results;
+}
+
+export async function installWellKnownToTargets(
+  skills: WellKnownSkill[],
+  targets: InstallTarget[],
+  options: { global: boolean; mode: InstallMode; continueOnError?: boolean }
+): Promise<TargetInstallResult[]> {
+  const results: TargetInstallResult[] = [];
+  for (const skill of skills) {
+    for (const target of targets) {
+      let result: Awaited<ReturnType<typeof installSkillForAgent>>;
+      try {
+        result = await installWellKnownSkillForAgent(skill, target.agent, {
+          global: options.global,
+          mode: options.mode,
+          eveSubagent: target.subagent,
+        });
+      } catch (error) {
+        if (!options.continueOnError) throw error;
+        result = { success: false, path: '', mode: options.mode, error: errorMessage(error) };
+      }
+      results.push({
+        ...result,
+        skill: skill.installName,
+        skillName: skill.installName,
+        target,
+        agent: targetDisplayName(target),
+        outcome: !result.success ? 'failed' : result.skipped ? 'skipped' : 'installed',
+      });
+    }
+  }
+  return results;
+}
+
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** Repo-relative SKILL.md path per skill name; local skills have none. */
@@ -1341,6 +1359,8 @@ export async function installFromSource(
     agents: AgentType[];
     via?: string;
     select?: (skills: Skill[]) => Promise<Skill[]>;
+    reason?: InstallReason;
+    installSource?: string;
   }
 ): Promise<SourceInstallResult> {
   const spinner = p.spinner();
@@ -1362,6 +1382,15 @@ export async function installFromSource(
       options.agents.map((agent) => ({ agent })),
       { global: false, mode: 'symlink', createMissingAgentRoot: () => true }
     );
+    if (options.reason === 'explicit') {
+      const source = options.installSource ?? parsed.url;
+      await recordCompletedSkills(
+        selected.map((skill) => skillLocator(source, skill.name)),
+        options.agents.map((agent) => ({ agent })),
+        results,
+        options.reason
+      );
+    }
     const installed = new Set(results.filter((r) => r.success).map((r) => r.skill));
     const repoPaths = getSkillRepoPaths(resolved, selected);
     for (const skill of selected) {
@@ -1395,6 +1424,19 @@ function sourceSkillHash(skill: Skill): Promise<string> {
 
 export async function runAdd(args: string[], options: AddOptions = {}): Promise<void> {
   const source = args[0];
+  if (
+    !source &&
+    !options.json &&
+    (options.list ||
+      options.all ||
+      options.skill?.length ||
+      options.liked ||
+      (process.stdin.isTTY && process.stdout.isTTY && !(await isRunningInAgent())))
+  ) {
+    const { runSavedAdd } = await import('./add-saved.ts');
+    await runSavedAdd(options);
+    return;
+  }
   let installTipShown = false;
 
   // ─── JSON output mode ───
@@ -1458,6 +1500,10 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     );
     installTipShown = true;
   };
+
+  if (source && options.liked) {
+    emitJsonAndExit(1, '--liked filters saved skills. Use skills add without a source.');
+  }
 
   if (!source) {
     console.log();
@@ -1530,13 +1576,19 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
   try {
     let effectiveSource = source;
     let notionSourceLabel: string | null = null;
+    let notionReplaySources: Array<{ path: string; source: string }> = [];
     const notionSkillPageId = parseNotionSkillUrl(source);
     if (isNotionSource(source) || notionSkillPageId) {
       const prepared = notionSkillPageId
         ? await prepareNotionSkillSource(notionSkillPageId)
-        : await prepareNotionPackSource(options);
+        : await prepareNotionPackSource(
+            source.toLowerCase().startsWith('notion:pack:')
+              ? { ...options, skill: [source.slice('notion:pack:'.length)], yes: true }
+              : options
+          );
       if (!prepared) return;
 
+      notionReplaySources = prepared.replaySources ?? [];
       effectiveSource = prepared.rootDir;
       tempDir = prepared.tempDir;
       notionSourceLabel =
@@ -1804,250 +1856,32 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
         )
       : Promise.resolve(null);
 
-    let targetAgents: AgentType[];
-    const validAgents = Object.keys(agents);
-
-    if (options.agent?.includes('*')) {
-      // --agent '*' selects all agents
-      targetAgents = validAgents as AgentType[];
-      p.log.info(`Installing to all ${targetAgents.length} agents`);
-    } else if (options.agent && options.agent.length > 0) {
-      const invalidAgents = options.agent.filter((a) => !validAgents.includes(a));
-
-      if (invalidAgents.length > 0) {
-        p.log.error(`Invalid agents: ${invalidAgents.join(', ')}`);
-        p.log.info(`Valid agents: ${validAgents.join(', ')}`);
-        await cleanup(tempDir);
-        emitJsonAndExit(1, `Invalid agents: ${invalidAgents.join(', ')}`);
-      }
-
-      targetAgents = options.agent as AgentType[];
-    } else {
-      spinner.start('Loading agents…');
-      const installedAgents = await detectInstalledAgents();
-      const totalAgents = Object.keys(agents).length;
-      spinner.stop(`${totalAgents} agents`);
-
-      if (installedAgents.includes('eve') && (options.yes || !agentResult.isAgent)) {
-        const useEve = options.yes
-          ? true
-          : await p.confirm({
-              message: formatEveInstallPromptMessage(selectedSkills),
-              initialValue: true,
-            });
-
-        if (p.isCancel(useEve)) {
-          await cleanup(tempDir);
-          exitInstallationCancelled();
-        }
-
-        if (useEve) {
-          targetAgents = ['eve'];
-          if (!options.yes) explicitlySelectedAgents.add('eve');
-          p.log.info(`Installing to: ${pc.cyan(EVE_AGENT_LABEL)}`);
-        } else {
-          const selected = await selectAgentsInteractive({ global: options.global });
-
-          if (isCancelled(selected)) {
-            await cleanup(tempDir);
-            exitInstallationCancelled();
-          }
-
-          targetAgents = selected as AgentType[];
-          for (const agent of targetAgents) explicitlySelectedAgents.add(agent);
-        }
-      } else if (installedAgents.length === 0) {
-        if (options.yes) {
-          targetAgents = validAgents as AgentType[];
-          p.log.info('Installing to all agents');
-        } else {
-          p.log.info('Select agents to install skills to');
-
-          const allAgentChoices = Object.entries(agents)
-            .filter(([key]) => key !== 'eve')
-            .map(([key, config]) => ({
-              value: key as AgentType,
-              label: config.displayName,
-            }));
-
-          // Use helper to prompt with search
-          const selected = await promptForAgents(
-            'Which agents do you want to install to?',
-            allAgentChoices
-          );
-
-          if (isCancelled(selected)) {
-            await cleanup(tempDir);
-            exitInstallationCancelled();
-          }
-
-          targetAgents = selected as AgentType[];
-          for (const agent of targetAgents) explicitlySelectedAgents.add(agent);
-        }
-      } else if (installedAgents.length === 1 || options.yes) {
-        // Auto-select detected agents + ensure universal agents are included
-        targetAgents = ensureUniversalAgents(installedAgents);
-        if (installedAgents.length === 1) {
-          const firstAgent = installedAgents[0]!;
-          p.log.info(`Installing to: ${pc.cyan(agents[firstAgent].displayName)}`);
-        } else {
-          p.log.info(
-            `Installing to: ${installedAgents.map((a) => pc.cyan(agents[a].displayName)).join(', ')}`
-          );
-        }
-      } else {
-        const selected = await selectAgentsInteractive({ global: options.global });
-
-        if (isCancelled(selected)) {
-          await cleanup(tempDir);
-          exitInstallationCancelled();
-        }
-
-        targetAgents = selected as AgentType[];
-        for (const agent of targetAgents) explicitlySelectedAgents.add(agent);
-      }
-    }
-
-    // An explicit --subagent flag implies the user wants to target Eve.
-    if (options.subagent && options.subagent.length > 0) {
-      explicitlySelectedAgents.add('eve');
-      if (!targetAgents.includes('eve')) targetAgents = [...targetAgents, 'eve'];
-    }
-
-    // Eve supports subagents, each with their own skills directory at
-    // agent/subagents/<name>/skills in addition to the root agent/skills.
-    // When Eve is a target, choose which of those to install into.
-    let eveSubagentTargets: Array<string | undefined> = [undefined];
-    if (targetAgents.includes('eve')) {
-      const availableSubagents = getEveSubagents(process.cwd());
-
-      if (options.subagent && options.subagent.length > 0) {
-        // Non-interactive: 'root' or '.' selects the root agent.
-        eveSubagentTargets = options.subagent.map((s) =>
-          s === 'root' || s === '.' ? undefined : s
-        );
-      } else if (availableSubagents.length > 0 && !options.yes) {
-        const subagentChoices = [
-          { value: '', label: 'Root agent', hint: 'agent/skills' },
-          ...availableSubagents.map((name) => ({
-            value: name,
-            label: name,
-            hint: `agent/subagents/${name}/skills`,
-          })),
-        ];
-
-        const selectedSubagents = await p.multiselect({
-          message: 'Where should Eve skills be installed?',
-          options: subagentChoices,
-          initialValues: [''],
-          required: true,
-        });
-
-        if (p.isCancel(selectedSubagents)) {
-          await cleanup(tempDir);
-          exitInstallationCancelled();
-        }
-
-        eveSubagentTargets = (selectedSubagents as string[]).map((s) => (s === '' ? undefined : s));
-      }
-    }
-
-    const installTargets = buildInstallTargets(targetAgents, eveSubagentTargets);
-
-    let installGlobally = options.global ?? false;
-
-    // Check if any selected agents support global installation
-    const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
-
-    if (options.global === undefined && !options.yes && supportsGlobal) {
-      const scope = await p.select({
-        message: 'Installation scope',
-        options: [
-          {
-            value: false,
-            label: 'Project',
-            hint: 'Install in current directory (committed with your project)',
-          },
-          {
-            value: true,
-            label: 'Global',
-            hint: 'Install in home directory (available across all projects)',
-          },
-        ],
-      });
-
-      if (p.isCancel(scope)) {
-        await cleanup(tempDir);
-        exitInstallationCancelled();
-      }
-
-      installGlobally = scope as boolean;
-    }
-
-    // Determine install mode (symlink vs copy)
-    let installMode: InstallMode = options.copy ? 'copy' : 'symlink';
-
-    // Only prompt for install mode when there are multiple unique target directories.
-    // When all selected targets share the same skillsDir, symlink vs copy is meaningless.
-    // Eve writes skill files directly into each (sub)agent dir, so a symlink prompt is
-    // never meaningful when every target is Eve.
-    const allEve = installTargets.every((t) => t.agent === 'eve');
-    const uniqueDirs = new Set(
-      installTargets.map((t) =>
-        t.subagent ? `eve:subagent:${t.subagent}` : agents[t.agent].skillsDir
-      )
-    );
-
-    if (!options.copy && !options.yes && uniqueDirs.size > 1 && !allEve) {
-      const modeChoice = await p.select({
-        message: 'Installation method',
-        options: [
-          {
-            value: 'symlink',
-            label: 'Symlink (Recommended)',
-            hint: 'Single source of truth, easy updates',
-          },
-          { value: 'copy', label: 'Copy to all agents', hint: 'Independent copies for each agent' },
-        ],
-      });
-
-      if (p.isCancel(modeChoice)) {
-        await cleanup(tempDir);
-        exitInstallationCancelled();
-      }
-
-      installMode = modeChoice as InstallMode;
-    } else if (uniqueDirs.size <= 1 || allEve) {
-      // Single target directory (or all-Eve) — default to copy (no symlink needed)
-      installMode = 'copy';
-    }
+    const { targetAgents, installTargets, installGlobally, installMode, eveSubagentTargets } =
+      await selectInstallSettings(
+        selectedSkills,
+        options,
+        explicitlySelectedAgents,
+        agentResult.isAgent,
+        spinner
+      );
 
     const cwd = process.cwd();
-
-    // Build installation summary
     const summaryLines: string[] = [];
-
-    // Check if any skill will be overwritten (parallel)
-    const overwriteChecks = await Promise.all(
-      selectedSkills.flatMap((skill) =>
-        installTargets.map(async (target) => ({
-          skillName: skill.name,
-          target,
-          installed: await isSkillInstalled(skill.name, target.agent, {
-            global: installGlobally,
-            eveSubagent: target.subagent,
-          }),
-        }))
+    const skillSummaries = new Map(
+      await Promise.all(
+        selectedSkills.map(
+          async (skill) =>
+            [
+              skill.name,
+              await buildSkillSummaryLines(skill.name, {
+                installTargets,
+                installGlobally,
+                installMode,
+              }),
+            ] as const
+        )
       )
     );
-    // Keyed by skill name → target key → installed?
-    const overwriteStatus = new Map<string, Map<string, boolean>>();
-    for (const { skillName, target, installed } of overwriteChecks) {
-      if (!overwriteStatus.has(skillName)) {
-        overwriteStatus.set(skillName, new Map());
-      }
-      overwriteStatus.get(skillName)!.set(targetKey(target), installed);
-    }
 
     // Group selected skills for summary
     const groupedSummary: Record<string, Skill[]> = {};
@@ -2068,26 +1902,7 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
       for (const skill of skills) {
         if (summaryLines.length > 0) summaryLines.push('');
 
-        const canonicalPath =
-          installTargets.length === 1
-            ? getCanonicalPath(skill.name, {
-                global: installGlobally,
-                agent: installTargets[0]!.agent,
-                eveSubagent: installTargets[0]!.subagent,
-              })
-            : getCanonicalPath(skill.name, { global: installGlobally });
-        const shortCanonical = shortenPath(canonicalPath, cwd);
-        summaryLines.push(`${pc.cyan(shortCanonical)}`);
-        summaryLines.push(...buildTargetSummaryLines(installTargets, installMode));
-
-        const skillOverwrites = overwriteStatus.get(skill.name);
-        const overwriteAgents = installTargets
-          .filter((t) => skillOverwrites?.get(targetKey(t)))
-          .map(targetDisplayName);
-
-        if (overwriteAgents.length > 0) {
-          summaryLines.push(`  ${pc.yellow('overwrites:')} ${formatList(overwriteAgents)}`);
-        }
+        summaryLines.push(...skillSummaries.get(skill.name)!);
       }
     };
 
@@ -2158,156 +1973,30 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
 
     spinner.stop('Installation complete');
 
+    await recordCompletedSkills(
+      selectedSkills.map((skill) => {
+        const replay = notionReplaySources.find(
+          (entry) => skill.path === entry.path || skill.path.startsWith(entry.path + sep)
+        );
+        return skillLocator(replay?.source ?? source, skill.name);
+      }),
+      installTargets,
+      results,
+      options.reason
+    );
+
     console.log();
     const successful = results.filter((r) => r.success);
     const failed = results.filter((r) => !r.success);
-    const successfulSkillNames = new Set(successful.map((r) => r.skill));
-    // Track installation result
-    // Build skillFiles map: { skillName: relative path to SKILL.md from repo root }
-    const skillFiles = getSkillRepoPaths(resolved, selectedSkills);
-
-    // Normalize source to owner/repo format for telemetry
-    const normalizedSource = directDownload ? null : getOwnerRepo(parsed);
-
-    const lockSource = directDownload ? null : getLockSource(parsed.url, normalizedSource);
-
-    // Only track if we have a valid remote source and it's not a private repo.
-    // repoPrivacyPromise was started early (right after parsing) so it has
-    // already been running in parallel with the entire install — no stall here.
-    if (normalizedSource) {
-      const ownerRepo = parseOwnerRepo(normalizedSource);
-      if (ownerRepo) {
-        const isPrivate = await repoPrivacyPromise;
-        // Only send telemetry if repo is public (isPrivate === false)
-        // If we can't determine (null), err on the side of caution and skip telemetry
-        if (isPrivate === false) {
-          track({
-            event: 'install',
-            source: normalizedSource,
-            skills: selectedSkills.map((s) => s.name).join(','),
-            agents: targetAgents.join(','),
-            ...(installGlobally && { global: '1' }),
-            skillFiles: JSON.stringify(skillFiles),
-            metadata: options.metadata,
-          });
-        }
-      } else {
-        // If we can't parse owner/repo, still send telemetry (for non-GitHub sources)
-        track({
-          event: 'install',
-          source: normalizedSource,
-          skills: selectedSkills.map((s) => s.name).join(','),
-          agents: targetAgents.join(','),
-          ...(installGlobally && { global: '1' }),
-          skillFiles: JSON.stringify(skillFiles),
-          metadata: options.metadata,
-        });
-      }
-    }
-
-    // Content hash per installed skill (blob snapshot or folder hash), for the
-    // project lock below and --json. The global lock derives its own from the
-    // repo tree, so skip the walk when neither consumer needs it.
-    const installedSkillHashes = new Map<string, string>();
-    if (successful.length > 0 && (jsonMode || !installGlobally)) {
-      for (const skill of selectedSkills) {
-        const skillDisplayName = getSkillDisplayName(skill);
-        if (!successfulSkillNames.has(skillDisplayName)) continue;
-        try {
-          installedSkillHashes.set(skillDisplayName, await sourceSkillHash(skill));
-        } catch {
-          // Hash is informational; lock writing skips skills without one.
-        }
-      }
-    }
-
-    // Add to skill lock file for update tracking (only for global installs)
-    // Notion installs are downloaded to a temp dir that parses as `local` and is deleted in the
-    // finally block below, so only a real local path is recorded (same guard as the project lock).
-    if (
-      successful.length > 0 &&
-      installGlobally &&
-      (normalizedSource || (parsed.type === 'local' && !directDownload))
-    ) {
-      // For GitHub clone installs, fetch the repo tree once and reuse it
-      // for all skills — avoids N sequential API calls that take ~400ms each.
-      let cachedTree: Awaited<ReturnType<typeof fetchRepoTree>> | undefined;
-      if (parsed.type === 'github' && !blobResult && normalizedSource) {
-        cachedTree = await fetchRepoTree(normalizedSource, parsed.ref, getGitHubToken);
-      }
-
-      for (const skill of selectedSkills) {
-        const skillDisplayName = getSkillDisplayName(skill);
-        if (successfulSkillNames.has(skillDisplayName)) {
-          try {
-            let skillFolderHash = '';
-            const skillPathValue = skillFiles[skill.name];
-
-            if (blobResult && skillPathValue) {
-              const hash = getSkillFolderHashFromTree(blobResult.tree, skillPathValue);
-              if (hash) skillFolderHash = hash;
-            } else if (parsed.type === 'github' && skillPathValue && cachedTree) {
-              const hash = getSkillFolderHashFromTree(cachedTree, skillPathValue);
-              if (hash) skillFolderHash = hash;
-            } else if (skillPathValue && tempDir) {
-              const skillDir = join(tempDir, dirname(skillPathValue));
-              const hash = await computeSkillFolderHash(skillDir);
-              if (hash) skillFolderHash = hash;
-            } else if (parsed.type === 'local') {
-              // Local sources aren't cloned into tempDir, so hash the skill's
-              // own directory directly (same approach as the project-scope lock below).
-              const hash = await computeSkillFolderHash(skill.path);
-              if (hash) skillFolderHash = hash;
-            }
-
-            await addSkillToLock(skill.name, {
-              source: lockSource || normalizedSource || parsed.url,
-              sourceType: parsed.type,
-              sourceUrl: parsed.url,
-              ref: parsed.ref,
-              skillPath: skillPathValue,
-              skillFolderHash,
-              pluginName: skill.pluginName,
-            });
-          } catch {
-            // Don't fail installation if lock file update fails
-          }
-        }
-      }
-    }
-
-    // Add to local lock file for project-scoped installs
-    if (successful.length > 0 && !installGlobally && !directDownload) {
-      // Record Eve subagent placement (root = '') so `update` can restore it.
-      // Only meaningful when Eve is among the targets and a non-root subagent
-      // was selected; otherwise omit for a clean, minimal lock entry.
-      const eveSubagents = targetAgents.includes('eve')
-        ? eveSubagentTargets.map((s) => s ?? '')
-        : undefined;
-      const recordSubagents =
-        eveSubagents && (eveSubagents.length > 1 || eveSubagents.some((s) => s !== ''));
-      for (const skill of selectedSkills) {
-        const skillDisplayName = getSkillDisplayName(skill);
-        if (successfulSkillNames.has(skillDisplayName)) {
-          try {
-            // Reuse the hash computed above (blob snapshot or folder hash)
-            const computedHash = installedSkillHashes.get(skillDisplayName);
-            if (computedHash === undefined) continue;
-            const skillPathValue = skillFiles[skill.name];
-            await addSkillToLocalLock(
-              skill.name,
-              {
-                ...projectLockEntry(parsed, skillPathValue, computedHash),
-                ...(recordSubagents && { subagents: eveSubagents }),
-              },
-              cwd
-            );
-          } catch {
-            // Don't fail installation if lock file update fails
-          }
-        }
-      }
-    }
+    const { normalizedSource, installedSkillHashes } = await persistDiskInstallation(
+      resolved,
+      parsed,
+      selectedSkills,
+      results,
+      { targetAgents, installGlobally, eveSubagentTargets },
+      options,
+      { directDownload, privacy: repoPrivacyPromise }
+    );
 
     // JSON output: one entry per skill, collapsing per-skill×agent results.
     // A skill is failed if any target failed, otherwise installed.
@@ -2458,6 +2147,16 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
     // Prompt for find-skills after successful install
     await promptForFindSkills(options, targetAgents);
   } catch (error) {
+    if (error instanceof InvalidAgentsError) {
+      p.log.error(error.message);
+      p.log.info(`Valid agents: ${Object.keys(agents).join(', ')}`);
+      await cleanup(tempDir);
+      emitJsonAndExit(1, error.message);
+    }
+    if (error instanceof InstallationCancelled) {
+      await cleanup(tempDir);
+      exitInstallationCancelled();
+    }
     if (error instanceof GitCloneError) {
       p.log.error(pc.red('Failed to clone repository'));
       // Print each line of the error message separately for better formatting
@@ -2483,13 +2182,500 @@ export async function runAdd(args: string[], options: AddOptions = {}): Promise<
   }
 }
 
-// Cleanup helper
-async function cleanup(tempDir: string | null) {
+export async function cleanup(tempDir: string | null) {
   if (tempDir) {
     try {
       await cleanupTempDir(tempDir);
     } catch {
       // Ignore cleanup errors
+    }
+  }
+}
+
+export class InstallationCancelled extends Error {
+  constructor() {
+    super('Installation cancelled');
+  }
+}
+
+class InvalidAgentsError extends Error {}
+
+export async function selectInstallSettings(
+  selectedSkills: Skill[],
+  options: AddOptions = {},
+  explicitlySelectedAgents = new Set<AgentType>(
+    options.agent?.filter((name): name is AgentType => name in agents)
+  ),
+  inAgent = false,
+  spinner = p.spinner()
+) {
+  let targetAgents: AgentType[];
+  const validAgents = Object.keys(agents);
+
+  if (options.agent?.includes('*')) {
+    // --agent '*' selects all agents
+    targetAgents = validAgents as AgentType[];
+    p.log.info(`Installing to all ${targetAgents.length} agents`);
+  } else if (options.agent && options.agent.length > 0) {
+    const invalidAgents = options.agent.filter((a) => !validAgents.includes(a));
+
+    if (invalidAgents.length > 0) {
+      throw new InvalidAgentsError(`Invalid agents: ${invalidAgents.join(', ')}`);
+    }
+
+    targetAgents = options.agent as AgentType[];
+  } else {
+    spinner.start('Loading agents…');
+    const installedAgents = await detectInstalledAgents();
+    const totalAgents = Object.keys(agents).length;
+    spinner.stop(`${totalAgents} agents`);
+
+    if (installedAgents.includes('eve') && (options.yes || !inAgent)) {
+      const useEve = options.yes
+        ? true
+        : await p.confirm({
+            message: formatEveInstallPromptMessage(selectedSkills),
+            initialValue: true,
+          });
+
+      if (p.isCancel(useEve)) {
+        throw new InstallationCancelled();
+      }
+
+      if (useEve) {
+        targetAgents = ['eve'];
+        if (!options.yes) explicitlySelectedAgents.add('eve');
+        p.log.info(`Installing to: ${pc.cyan(EVE_AGENT_LABEL)}`);
+      } else {
+        const selected = await selectAgentsInteractive({ global: options.global });
+
+        if (isCancelled(selected)) {
+          throw new InstallationCancelled();
+        }
+
+        targetAgents = selected as AgentType[];
+        for (const agent of targetAgents) explicitlySelectedAgents.add(agent);
+      }
+    } else if (installedAgents.length === 0) {
+      if (options.yes) {
+        targetAgents = validAgents as AgentType[];
+        p.log.info('Installing to all agents');
+      } else {
+        p.log.info('Select agents to install skills to');
+
+        const allAgentChoices = Object.entries(agents)
+          .filter(([key]) => key !== 'eve')
+          .map(([key, config]) => ({
+            value: key as AgentType,
+            label: config.displayName,
+          }));
+
+        // Use helper to prompt with search
+        const selected = await promptForAgents(
+          'Which agents do you want to install to?',
+          allAgentChoices
+        );
+
+        if (isCancelled(selected)) {
+          throw new InstallationCancelled();
+        }
+
+        targetAgents = selected as AgentType[];
+        for (const agent of targetAgents) explicitlySelectedAgents.add(agent);
+      }
+    } else if (installedAgents.length === 1 || options.yes) {
+      // Auto-select detected agents + ensure universal agents are included
+      targetAgents = ensureUniversalAgents(installedAgents);
+      if (installedAgents.length === 1) {
+        const firstAgent = installedAgents[0]!;
+        p.log.info(`Installing to: ${pc.cyan(agents[firstAgent].displayName)}`);
+      } else {
+        p.log.info(
+          `Installing to: ${installedAgents.map((a) => pc.cyan(agents[a].displayName)).join(', ')}`
+        );
+      }
+    } else {
+      const selected = await selectAgentsInteractive({ global: options.global });
+
+      if (isCancelled(selected)) {
+        throw new InstallationCancelled();
+      }
+
+      targetAgents = selected as AgentType[];
+      for (const agent of targetAgents) explicitlySelectedAgents.add(agent);
+    }
+  }
+
+  // An explicit --subagent flag implies the user wants to target Eve.
+  if (options.subagent && options.subagent.length > 0) {
+    explicitlySelectedAgents.add('eve');
+    if (!targetAgents.includes('eve')) targetAgents = [...targetAgents, 'eve'];
+  }
+
+  // Eve supports subagents, each with their own skills directory at
+  // agent/subagents/<name>/skills in addition to the root agent/skills.
+  // When Eve is a target, choose which of those to install into.
+  let eveSubagentTargets: Array<string | undefined> = [undefined];
+  if (targetAgents.includes('eve')) {
+    const availableSubagents = getEveSubagents(process.cwd());
+
+    if (options.subagent && options.subagent.length > 0) {
+      // Non-interactive: 'root' or '.' selects the root agent.
+      eveSubagentTargets = options.subagent.map((s) => (s === 'root' || s === '.' ? undefined : s));
+    } else if (availableSubagents.length > 0 && !options.yes) {
+      const subagentChoices = [
+        { value: '', label: 'Root agent', hint: 'agent/skills' },
+        ...availableSubagents.map((name) => ({
+          value: name,
+          label: name,
+          hint: `agent/subagents/${name}/skills`,
+        })),
+      ];
+
+      const selectedSubagents = await p.multiselect({
+        message: 'Where should Eve skills be installed?',
+        options: subagentChoices,
+        initialValues: [''],
+        required: true,
+      });
+
+      if (p.isCancel(selectedSubagents)) {
+        throw new InstallationCancelled();
+      }
+
+      eveSubagentTargets = (selectedSubagents as string[]).map((s) => (s === '' ? undefined : s));
+    }
+  }
+
+  const installTargets = buildInstallTargets(targetAgents, eveSubagentTargets);
+
+  let installGlobally = options.global ?? false;
+
+  // Check if any selected agents support global installation
+  const supportsGlobal = targetAgents.some((a) => agents[a].globalSkillsDir !== undefined);
+
+  if (options.global === undefined && !options.yes && supportsGlobal) {
+    const scope = await p.select({
+      message: 'Installation scope',
+      options: [
+        {
+          value: false,
+          label: 'Project',
+          hint: 'Install in current directory (committed with your project)',
+        },
+        {
+          value: true,
+          label: 'Global',
+          hint: 'Install in home directory (available across all projects)',
+        },
+      ],
+    });
+
+    if (p.isCancel(scope)) {
+      throw new InstallationCancelled();
+    }
+
+    installGlobally = scope as boolean;
+  }
+
+  // Determine install mode (symlink vs copy)
+  let installMode: InstallMode = options.copy ? 'copy' : 'symlink';
+
+  // Only prompt for install mode when there are multiple unique target directories.
+  // When all selected targets share the same skillsDir, symlink vs copy is meaningless.
+  // Eve writes skill files directly into each (sub)agent dir, so a symlink prompt is
+  // never meaningful when every target is Eve.
+  const allEve = installTargets.every((t) => t.agent === 'eve');
+  const uniqueDirs = new Set(
+    installTargets.map((t) =>
+      t.subagent ? `eve:subagent:${t.subagent}` : agents[t.agent].skillsDir
+    )
+  );
+
+  if (!options.copy && !options.yes && uniqueDirs.size > 1 && !allEve) {
+    const modeChoice = await p.select({
+      message: 'Installation method',
+      options: [
+        {
+          value: 'symlink',
+          label: 'Symlink (Recommended)',
+          hint: 'Single source of truth, easy updates',
+        },
+        { value: 'copy', label: 'Copy to all agents', hint: 'Independent copies for each agent' },
+      ],
+    });
+
+    if (p.isCancel(modeChoice)) {
+      throw new InstallationCancelled();
+    }
+
+    installMode = modeChoice as InstallMode;
+  } else if (uniqueDirs.size <= 1 || allEve) {
+    // Single target directory (or all-Eve) — default to copy (no symlink needed)
+    installMode = 'copy';
+  }
+
+  return {
+    targetAgents,
+    installTargets,
+    installGlobally,
+    installMode,
+    eveSubagentTargets,
+    explicitlySelectedAgents,
+  };
+}
+
+export type InstallSettings = Awaited<ReturnType<typeof selectInstallSettings>>;
+
+/** Existing lockfile and telemetry behavior shared by add and personal sessions. */
+export async function persistDiskInstallation(
+  resolved: ResolvedSkills,
+  parsed: ParsedSource,
+  selectedSkills: Skill[],
+  results: TargetInstallResult[],
+  settings: Pick<InstallSettings, 'targetAgents' | 'installGlobally' | 'eveSubagentTargets'>,
+  options: Pick<AddOptions, 'metadata' | 'json'> = {},
+  details: { directDownload?: boolean; privacy?: Promise<boolean | null> } = {}
+) {
+  const { targetAgents, installGlobally, eveSubagentTargets } = settings;
+  const { tempDir, blobResult } = resolved;
+  const cwd = process.cwd();
+  const jsonMode = options.json;
+  const directDownload =
+    details.directDownload ?? (parsed.type === 'download' || parsed.type === 'well-known');
+  const repoPrivacyPromise = details.privacy ?? Promise.resolve(null);
+  const successful = results.filter((r) => r.success);
+  const successfulSkillNames = new Set(successful.map((r) => r.skill));
+  // Track installation result
+  // Build skillFiles map: { skillName: relative path to SKILL.md from repo root }
+  const skillFiles = getSkillRepoPaths(resolved, selectedSkills);
+
+  // Normalize source to owner/repo format for telemetry
+  const normalizedSource = directDownload ? null : getOwnerRepo(parsed);
+
+  const lockSource = directDownload ? null : getLockSource(parsed.url, normalizedSource);
+
+  // Only track if we have a valid remote source and it's not a private repo.
+  // repoPrivacyPromise was started early (right after parsing) so it has
+  // already been running in parallel with the entire install — no stall here.
+  if (normalizedSource) {
+    const ownerRepo = parseOwnerRepo(normalizedSource);
+    if (ownerRepo) {
+      const isPrivate = await repoPrivacyPromise;
+      // Only send telemetry if repo is public (isPrivate === false)
+      // If we can't determine (null), err on the side of caution and skip telemetry
+      if (isPrivate === false) {
+        track({
+          event: 'install',
+          source: normalizedSource,
+          skills: selectedSkills.map((s) => s.name).join(','),
+          agents: targetAgents.join(','),
+          ...(installGlobally && { global: '1' }),
+          skillFiles: JSON.stringify(skillFiles),
+          metadata: options.metadata,
+        });
+      }
+    } else {
+      // If we can't parse owner/repo, still send telemetry (for non-GitHub sources)
+      track({
+        event: 'install',
+        source: normalizedSource,
+        skills: selectedSkills.map((s) => s.name).join(','),
+        agents: targetAgents.join(','),
+        ...(installGlobally && { global: '1' }),
+        skillFiles: JSON.stringify(skillFiles),
+        metadata: options.metadata,
+      });
+    }
+  }
+
+  // Content hash per installed skill (blob snapshot or folder hash), for the
+  // project lock below and --json. The global lock derives its own from the
+  // repo tree, so skip the walk when neither consumer needs it.
+  const installedSkillHashes = new Map<string, string>();
+  if (successful.length > 0 && (jsonMode || !installGlobally)) {
+    for (const skill of selectedSkills) {
+      const skillDisplayName = getSkillDisplayName(skill);
+      if (!successfulSkillNames.has(skillDisplayName)) continue;
+      try {
+        installedSkillHashes.set(skillDisplayName, await sourceSkillHash(skill));
+      } catch {
+        // Hash is informational; lock writing skips skills without one.
+      }
+    }
+  }
+
+  // Add to skill lock file for update tracking (only for global installs)
+  // Notion installs are downloaded to a temp dir that parses as `local` and is deleted in the
+  // finally block below, so only a real local path is recorded (same guard as the project lock).
+  if (
+    successful.length > 0 &&
+    installGlobally &&
+    (normalizedSource || (parsed.type === 'local' && !directDownload))
+  ) {
+    // For GitHub clone installs, fetch the repo tree once and reuse it
+    // for all skills — avoids N sequential API calls that take ~400ms each.
+    let cachedTree: Awaited<ReturnType<typeof fetchRepoTree>> | undefined;
+    if (parsed.type === 'github' && !blobResult && normalizedSource) {
+      cachedTree = await fetchRepoTree(normalizedSource, parsed.ref, getGitHubToken);
+    }
+
+    for (const skill of selectedSkills) {
+      const skillDisplayName = getSkillDisplayName(skill);
+      if (successfulSkillNames.has(skillDisplayName)) {
+        try {
+          let skillFolderHash = '';
+          const skillPathValue = skillFiles[skill.name];
+
+          if (blobResult && skillPathValue) {
+            const hash = getSkillFolderHashFromTree(blobResult.tree, skillPathValue);
+            if (hash) skillFolderHash = hash;
+          } else if (parsed.type === 'github' && skillPathValue && cachedTree) {
+            const hash = getSkillFolderHashFromTree(cachedTree, skillPathValue);
+            if (hash) skillFolderHash = hash;
+          } else if (skillPathValue && tempDir) {
+            const skillDir = join(tempDir, dirname(skillPathValue));
+            const hash = await computeSkillFolderHash(skillDir);
+            if (hash) skillFolderHash = hash;
+          } else if (parsed.type === 'local') {
+            // Local sources aren't cloned into tempDir, so hash the skill's
+            // own directory directly (same approach as the project-scope lock below).
+            const hash = await computeSkillFolderHash(skill.path);
+            if (hash) skillFolderHash = hash;
+          }
+
+          await addSkillToLock(skill.name, {
+            source: lockSource || normalizedSource || parsed.url,
+            sourceType: parsed.type,
+            sourceUrl: parsed.url,
+            ref: parsed.ref,
+            skillPath: skillPathValue,
+            skillFolderHash,
+            pluginName: skill.pluginName,
+          });
+        } catch {
+          // Don't fail installation if lock file update fails
+        }
+      }
+    }
+  }
+
+  // Add to local lock file for project-scoped installs
+  if (successful.length > 0 && !installGlobally && !directDownload) {
+    // Record Eve subagent placement (root = '') so `update` can restore it.
+    // Only meaningful when Eve is among the targets and a non-root subagent
+    // was selected; otherwise omit for a clean, minimal lock entry.
+    const eveSubagents = targetAgents.includes('eve')
+      ? eveSubagentTargets.map((s) => s ?? '')
+      : undefined;
+    const recordSubagents =
+      eveSubagents && (eveSubagents.length > 1 || eveSubagents.some((s) => s !== ''));
+    for (const skill of selectedSkills) {
+      const skillDisplayName = getSkillDisplayName(skill);
+      if (successfulSkillNames.has(skillDisplayName)) {
+        try {
+          // Reuse the hash computed above (blob snapshot or folder hash)
+          const computedHash = installedSkillHashes.get(skillDisplayName);
+          if (computedHash === undefined) continue;
+          const skillPathValue = skillFiles[skill.name];
+          await addSkillToLocalLock(
+            skill.name,
+            {
+              ...projectLockEntry(parsed, skillPathValue, computedHash),
+              ...(recordSubagents && { subagents: eveSubagents }),
+            },
+            cwd
+          );
+        } catch {
+          // Don't fail installation if lock file update fails
+        }
+      }
+    }
+  }
+
+  return { normalizedSource, installedSkillHashes, skillFiles };
+}
+
+export async function persistWellKnownInstallation(
+  url: string,
+  selectedSkills: WellKnownSkill[],
+  results: TargetInstallResult[],
+  settings: Pick<InstallSettings, 'targetAgents' | 'installGlobally'>,
+  options: Pick<AddOptions, 'metadata'> = {},
+  privacy: Promise<boolean | null> = Promise.resolve(null)
+): Promise<void> {
+  const { targetAgents, installGlobally } = settings;
+  const cwd = process.cwd();
+  const sourceIdentifier = wellKnownProvider.getSourceIdentifier(url);
+  const successful = results.filter((r) => r.success);
+  const successfulSkillNames = new Set(successful.map((r) => r.skill));
+  // Build skillFiles map: { skillName: sourceUrl }
+  const skillFiles: Record<string, string> = {};
+  for (const skill of selectedSkills) {
+    skillFiles[skill.installName] = skill.sourceUrl;
+  }
+
+  // Privacy promise was started before installation — should be resolved by now
+  const isPrivate = await privacy;
+  if (isPrivate !== true) {
+    track({
+      event: 'install',
+      source: sourceIdentifier,
+      skills: selectedSkills.map((s) => s.installName).join(','),
+      agents: targetAgents.join(','),
+      ...(installGlobally && { global: '1' }),
+      skillFiles: JSON.stringify(skillFiles),
+      installUrl: url,
+      metadata: options.metadata,
+      sourceType: 'well-known',
+    });
+  }
+
+  // Add to skill lock file for update tracking (only for global installs)
+  if (successful.length > 0 && installGlobally) {
+    for (const skill of selectedSkills) {
+      if (successfulSkillNames.has(skill.installName)) {
+        try {
+          await addSkillToLock(skill.installName, {
+            source: sourceIdentifier,
+            sourceType: 'well-known',
+            sourceUrl: skill.sourceUrl,
+            skillFolderHash: '',
+            sourceBaseUrl: url,
+            wellKnownDigest: computeWellKnownSkillDigest(skill),
+          });
+        } catch {
+          // Don't fail installation if lock file update fails
+        }
+      }
+    }
+  }
+
+  // Add to local lock file for project-scoped installs
+  if (successful.length > 0 && !installGlobally) {
+    for (const skill of selectedSkills) {
+      if (successfulSkillNames.has(skill.installName)) {
+        try {
+          const matchingResult = successful.find((r) => r.skill === skill.installName);
+          const installDir = matchingResult?.canonicalPath || matchingResult?.path;
+          if (installDir) {
+            const computedHash = await computeSkillFolderHash(installDir);
+            await addSkillToLocalLock(
+              skill.installName,
+              {
+                source: sourceIdentifier,
+                sourceUrl: url,
+                sourceType: 'well-known',
+                computedHash,
+                wellKnownDigest: computeWellKnownSkillDigest(skill),
+              },
+              cwd
+            );
+          }
+        } catch {
+          // Don't fail installation if lock file update fails
+        }
+      }
     }
   }
 }
@@ -2590,6 +2776,8 @@ export function parseAddOptions(args: string[]): {
       options.list = true;
     } else if (arg === '--all') {
       options.all = true;
+    } else if (arg === '--liked') {
+      options.liked = true;
     } else if (arg === '-a' || arg === '--agent') {
       options.agent = options.agent || [];
       i++;

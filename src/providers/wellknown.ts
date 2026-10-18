@@ -110,6 +110,7 @@ export interface WellKnownSkill extends RemoteSkill {
 export interface FetchAllSkillsOptions {
   /** Include skills marked with metadata.internal: true. */
   includeInternal?: boolean;
+  signal?: AbortSignal;
 }
 
 /**
@@ -169,7 +170,7 @@ export class WellKnownProvider implements HostProvider {
    */
   async fetchIndex(
     baseUrl: string,
-    options?: { updateCheck?: boolean }
+    options?: { updateCheck?: boolean; signal?: AbortSignal }
   ): Promise<{
     index: WellKnownIndex;
     entries: NormalizedWellKnownEntry[];
@@ -183,7 +184,7 @@ export class WellKnownProvider implements HostProvider {
 
   private async fetchIndexCandidates(
     baseUrl: string,
-    options?: { updateCheck?: boolean }
+    options?: { updateCheck?: boolean; signal?: AbortSignal }
   ): Promise<
     Array<{
       index: WellKnownIndex;
@@ -196,7 +197,8 @@ export class WellKnownProvider implements HostProvider {
     try {
       const parsed = new URL(baseUrl);
       const basePath = parsed.pathname.replace(/\/$/, '');
-      const signal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+      const timeout = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+      const signal = options?.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
 
       const urlsToTry: Array<{
         indexUrl: string;
@@ -426,35 +428,40 @@ export class WellKnownProvider implements HostProvider {
   async fetchSkillByEntry(
     baseUrlOrEntry: string | NormalizedWellKnownEntry,
     legacyEntry?: WellKnownSkillEntryV1,
-    legacyWellKnownPath?: string
+    legacyWellKnownPath?: string,
+    signal?: AbortSignal
   ): Promise<WellKnownSkill | null> {
     if (typeof baseUrlOrEntry === 'string') {
       if (!legacyEntry) return null;
-      return this.fetchLegacySkillByEntry({
-        version: '0.1.0',
-        name: legacyEntry.name,
-        description: legacyEntry.description,
-        files: legacyEntry.files,
-        baseUrl: baseUrlOrEntry,
-        wellKnownPath: legacyWellKnownPath ?? this.WELL_KNOWN_PATHS[0],
-        indexEntry: legacyEntry,
-      });
+      return this.fetchLegacySkillByEntry(
+        {
+          version: '0.1.0',
+          name: legacyEntry.name,
+          description: legacyEntry.description,
+          files: legacyEntry.files,
+          baseUrl: baseUrlOrEntry,
+          wellKnownPath: legacyWellKnownPath ?? this.WELL_KNOWN_PATHS[0],
+          indexEntry: legacyEntry,
+        },
+        signal
+      );
     }
 
     if (baseUrlOrEntry.version === '0.1.0') {
-      return this.fetchLegacySkillByEntry(baseUrlOrEntry);
+      return this.fetchLegacySkillByEntry(baseUrlOrEntry, signal);
     }
 
-    return this.fetchArtifactSkillByEntry(baseUrlOrEntry);
+    return this.fetchArtifactSkillByEntry(baseUrlOrEntry, signal);
   }
 
   private async fetchLegacySkillByEntry(
-    entry: Extract<NormalizedWellKnownEntry, { version: '0.1.0' }>
+    entry: Extract<NormalizedWellKnownEntry, { version: '0.1.0' }>,
+    signal?: AbortSignal
   ) {
     try {
       const skillBaseUrl = `${entry.baseUrl.replace(/\/$/, '')}/${entry.wellKnownPath}/${entry.name}`;
       const skillMdUrl = `${skillBaseUrl}/SKILL.md`;
-      const response = await fetch(skillMdUrl);
+      const response = await fetch(skillMdUrl, { signal });
       if (!response.ok) return null;
 
       const content = await response.text();
@@ -468,7 +475,7 @@ export class WellKnownProvider implements HostProvider {
       const filePromises = otherFiles.map(async (filePath) => {
         try {
           const fileUrl = `${skillBaseUrl}/${filePath}`;
-          const fileResponse = await fetch(fileUrl);
+          const fileResponse = await fetch(fileUrl, { signal });
           if (fileResponse.ok) {
             const fileContent = await fileResponse.arrayBuffer();
             return { path: filePath, content: new Uint8Array(fileContent) };
@@ -500,10 +507,11 @@ export class WellKnownProvider implements HostProvider {
   }
 
   private async fetchArtifactSkillByEntry(
-    entry: Extract<NormalizedWellKnownEntry, { version: '0.2.0' }>
+    entry: Extract<NormalizedWellKnownEntry, { version: '0.2.0' }>,
+    signal?: AbortSignal
   ) {
     try {
-      const response = await fetch(entry.artifactUrl);
+      const response = await fetch(entry.artifactUrl, { signal });
       if (!response.ok) return null;
 
       const contentType = response.headers.get('content-type') ?? '';
@@ -609,7 +617,7 @@ export class WellKnownProvider implements HostProvider {
     options: FetchAllSkillsOptions = {}
   ): Promise<WellKnownSkill[]> {
     try {
-      const candidates = await this.fetchIndexCandidates(url);
+      const candidates = await this.fetchIndexCandidates(url, { signal: options.signal });
       const scope = this.getScope(url);
       const scopedCandidates = scope
         ? candidates.filter((c) => c.resolvedBaseUrl !== scope.rootBaseUrl)
@@ -617,7 +625,9 @@ export class WellKnownProvider implements HostProvider {
       const includeInternal = options.includeInternal || shouldInstallInternalSkills();
 
       for (const result of scopedCandidates) {
-        const skillPromises = result.entries.map((entry) => this.fetchSkillByEntry(entry));
+        const skillPromises = result.entries.map((entry) =>
+          this.fetchSkillByEntry(entry, undefined, undefined, options.signal)
+        );
         const results = await Promise.all(skillPromises);
         const skills = results
           .filter((s: WellKnownSkill | null): s is WellKnownSkill => s !== null)

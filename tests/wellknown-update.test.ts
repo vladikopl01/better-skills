@@ -1,10 +1,21 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { checkWellKnownForUpdates, type WellKnownUpdateItem } from '../src/update.ts';
+import {
+  checkWellKnownForUpdates,
+  updateGlobalSkills,
+  type WellKnownUpdateItem,
+} from '../src/update.ts';
+import * as childProcess from 'child_process';
+import * as skillLock from '../src/skill-lock.ts';
 import {
   computeWellKnownSkillDigest,
   wellKnownProvider,
   type WellKnownSkill,
 } from '../src/providers/index.ts';
+
+vi.mock('child_process', async (original) => ({
+  ...(await original<typeof import('child_process')>()),
+  spawnSync: vi.fn(),
+}));
 
 const BASE_URL = 'https://skills.example.com/p/testpack';
 
@@ -76,6 +87,8 @@ async function digestOf(name: string, contents = V1_CONTENTS): Promise<string> {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
 
@@ -129,6 +142,42 @@ describe('computeWellKnownSkillDigest', () => {
 });
 
 describe('checkWellKnownForUpdates', () => {
+  it('marks well-known update subprocesses as maintenance and preserves environment opt-outs', async () => {
+    stubWellKnownServer(v2Index([{ name: 'alpha-skill', digest: DIGEST_A }]));
+    vi.stubEnv('DISABLE_TELEMETRY', '1');
+    vi.stubEnv('GH_HOST', 'github.example.test');
+    const spawn = vi.mocked(childProcess.spawnSync).mockReturnValue({
+      pid: 0,
+      output: [],
+      stdout: '',
+      stderr: '',
+      status: 0,
+      signal: null,
+    });
+    vi.spyOn(skillLock, 'readSkillLock').mockResolvedValue({
+      version: 3,
+      skills: {
+        'alpha-skill': {
+          source: 'skills.example.com',
+          sourceType: 'well-known',
+          sourceUrl: BASE_URL,
+          sourceBaseUrl: BASE_URL,
+          wellKnownDigest: DIGEST_STALE,
+          skillFolderHash: '',
+          installedAt: '',
+          updatedAt: '',
+        },
+      },
+    });
+    await updateGlobalSkills({ yes: true });
+    const call = spawn.mock.calls.find((call) => Array.isArray(call[1]) && call[1].includes('add'));
+    expect(call?.[2]?.env).toMatchObject({
+      SKILLS_CLI_INSTALL_REASON: 'maintenance',
+      DISABLE_TELEMETRY: '1',
+      GH_HOST: 'github.example.test',
+    });
+  });
+
   it('returns error when no index is served', async () => {
     stubWellKnownServer(null);
     const result = await checkWellKnownForUpdates(BASE_URL, [

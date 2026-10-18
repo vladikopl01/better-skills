@@ -17,6 +17,8 @@ interface ListOptions {
   global?: boolean;
   agent?: string[];
   json?: boolean;
+  saved?: boolean;
+  liked?: boolean;
 }
 
 interface ListLockEntry {
@@ -61,6 +63,10 @@ export function parseListOptions(args: string[]): ListOptions {
       options.global = true;
     } else if (arg === '--json') {
       options.json = true;
+    } else if (arg === '--saved') {
+      options.saved = true;
+    } else if (arg === '--liked') {
+      options.liked = true;
     } else if (arg === '-a' || arg === '--agent') {
       options.agent = options.agent || [];
       // Collect all following arguments until next flag
@@ -75,6 +81,21 @@ export function parseListOptions(args: string[]): ListOptions {
 
 export async function runList(args: string[]): Promise<void> {
   const options = parseListOptions(args);
+  if (options.saved || options.liked) {
+    try {
+      if (!options.saved) throw new Error('Use --saved to filter your saved skills.');
+      if (options.global || options.agent) {
+        throw new Error('--saved lists your personal library. Omit --global and --agent.');
+      }
+      const { runSavedList } = await import('./saved-skills.ts');
+      await runSavedList(options);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      if (options.json) console.log('[]');
+      process.exitCode = 1;
+    }
+    return;
+  }
 
   // Default to project only (local), use -g for global
   const scope = options.global === true ? true : false;
