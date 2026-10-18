@@ -184,15 +184,16 @@ export async function browseSkills(liked = false): Promise<SkillLocator[] | symb
       );
       const rows = skills.slice(start, start + limit).map((skill, index) => {
         const key = personalSkillKey(skill);
-        const count = clip(installCount(skill), columns - 12);
-        const width = Math.max(1, columns - approxStringWidth(count) - 8);
+        const liked = personal.get(key)?.liked ? ' ♥' : '';
+        const count = clip(installCount(skill), columns - approxStringWidth(liked) - 12);
+        const width = Math.max(1, columns - approxStringWidth(count + liked) - 8);
         const name = clip(
-          sanitizeMetadata(`${skill.name}${personal.get(key)?.liked ? ' ♥' : ''}`),
+          sanitizeMetadata(skill.name),
           Math.min(32, width, Math.max(12, Math.ceil(width / 2)))
         );
         const hint = clip(skillHint(skill, inventory), width - approxStringWidth(name));
         const active = start + index === view.cursor;
-        return `${bar} ${active ? pc.cyan('❯') : ' '} ${selected.has(key) ? pc.green('●') : pc.dim('○')} ${active ? pc.underline(name) : name} ${pc.dim(hint)} ${pc.cyan(count)}`;
+        return `${bar} ${active ? pc.cyan('❯') : ' '} ${selected.has(key) ? pc.green('●') : pc.dim('○')} ${active ? pc.underline(name) : name} ${pc.dim(hint)} ${pc.cyan(count)}${liked}`;
       });
       if (skills.length > limit || pagination) rows.push(position);
       draw([...lines, ...rows, ...footer]);

@@ -77,18 +77,18 @@ describe('skill browser', () => {
     expect(fetch).not.toHaveBeenCalled();
     press('tab');
     expect(frame()).toContain('[Liked]');
-    expect(frame()).toContain('alpha ♥');
+    expect(frame()).toContain('alpha owner/repo 0 installs by you ♥');
     expect(frame()).not.toContain('○ beta');
     press('tab');
     await vi.waitFor(() => expect(frame()).toContain('9K installs'));
     expect(frame()).toContain('Top skills on skills.sh (2)');
     expect(frame()).not.toContain('Filter:');
-    expect(frame().indexOf('alpha ♥')).toBeLessThan(frame().indexOf('○ beta'));
+    expect(frame().indexOf('○ alpha')).toBeLessThan(frame().indexOf('○ beta'));
     press('tab');
     expect(frame()).toContain('[Your most installed]');
     expect(frame()).toContain('1 install by you');
     expect(frame()).toContain('○ beta');
-    expect(frame()).not.toContain('alpha ♥');
+    expect(frame()).not.toContain('♥');
     expect((await readPersonalCatalog()).skills.map((skill) => skill.installCount)).toEqual([0, 1]);
   });
 
@@ -97,7 +97,7 @@ describe('skill browser', () => {
     type('alpha');
     await vi.waitFor(() => expect(frame()).toContain('○ alpha'));
     press('l', { ctrl: true });
-    await vi.waitFor(() => expect(frame()).toContain('alpha ♥'));
+    await vi.waitFor(() => expect(frame()).toContain('alpha owner/repo 9K installs ♥'));
     expect((await readPersonalCatalog()).skills).toMatchObject([
       { name: 'alpha', liked: true, installCount: 0 },
     ]);
@@ -108,7 +108,7 @@ describe('skill browser', () => {
     input.end('\u0000');
     await vi.waitFor(() => expect(frame()).toContain('(1 selected)'));
     press('tab');
-    expect(frame()).toContain('● alpha ♥');
+    expect(frame()).toContain('● alpha owner/repo 0 installs by you ♥');
     expect(frame()).toContain('(1 selected)');
     press('return');
     await expect(prompt).resolves.toMatchObject([{ ...locator('alpha'), liked: true }]);
@@ -122,7 +122,7 @@ describe('skill browser', () => {
     press('left');
     await vi.waitFor(() => expect(frame()).toContain('Offline'));
     press('left');
-    expect(frame()).toContain('alpha ♥');
+    expect(frame()).toContain('alpha owner/repo 0 installs by you ♥');
     expect(frame()).not.toContain('Offline');
     press('right');
     await vi.waitFor(() => expect(frame()).toContain('9K installs'));
@@ -367,26 +367,34 @@ describe('skill browser', () => {
     ]);
   });
 
-  it('keeps long skill rows on one line at compact and normal terminal widths', async () => {
-    vi.mocked(fetch).mockResolvedValue(
-      Response.json({
-        skills: [
-          { ...alpha, name: 'a-long-skill-name-with-many-words', source: 'owner/a-long-repo-name' },
-        ],
-      })
-    );
+  it('keeps liked status visible beside counts when long skill rows are truncated', async () => {
+    const skill = {
+      ...alpha,
+      name: 'thermo-nuclear-code-quality-review',
+      source: 'owner/a-long-repo-name',
+    };
+    await updatePersonalSkill(skillLocator(`https://github.com/${skill.source}.git`, skill.name), {
+      liked: true,
+      increment: true,
+    });
+    vi.mocked(fetch).mockImplementation(async () => Response.json({ skills: [skill] }));
     await open();
     type('skill');
-    await vi.waitFor(() => expect(frame()).toContain('9K installs'));
-    for (const columns of [40, 80]) {
-      Object.defineProperty(process.stdout, 'columns', { configurable: true, value: columns });
-      process.stdout.emit('resize');
-      const row = frame()
-        .split('\n')
-        .find((line) => line.includes('○'));
-      expect(row).toContain('9K installs');
-      expect(approxStringWidth(row ?? '')).toBeLessThanOrEqual(columns);
+    for (const count of ['9K installs', '1 install by you', '9K installs', '1 install by you']) {
+      await vi.waitFor(() => expect(frame()).toContain(count));
+      for (const columns of [40, 80, 120]) {
+        Object.defineProperty(process.stdout, 'columns', { configurable: true, value: columns });
+        process.stdout.emit('resize');
+        const row = frame()
+          .split('\n')
+          .find((line) => line.includes('○'));
+        expect(row).toContain(`${count} ♥`);
+        expect(approxStringWidth(row ?? '')).toBeLessThanOrEqual(columns);
+      }
+      press('tab');
     }
+    press('l', { ctrl: true });
+    await vi.waitFor(() => expect(frame()).not.toContain('♥'));
   });
 
   it('shows the saved revision used by a preview while retaining ecosystem counts', async () => {
