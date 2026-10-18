@@ -42,11 +42,14 @@ export interface PreparedNotionPackSource {
   tempDir: string;
   packCount: number;
   skillCount: number;
+  /** Durable pack locators for skills staged in temporary directories. */
+  replaySources?: Array<{ path: string; source: string }>;
 }
 
 export interface PreparedNotionSkillSource {
   rootDir: string;
   tempDir: string;
+  replaySources?: Array<{ path: string; source: string }>;
 }
 
 export interface NotionPackSelectorOptions {
@@ -63,12 +66,16 @@ interface FetchNotionPacksOptions {
 
 interface PrepareNotionPackSourceOptions extends NotionPackSelectorOptions {
   runNtn?: NtnRunner;
+  signal?: AbortSignal;
+  spinner?: Pick<ReturnType<typeof p.spinner>, 'start' | 'stop'>;
   download?: (url: string) => Promise<DownloadedSource>;
   discover?: typeof discoverSkills;
 }
 
 interface PrepareNotionSkillSourceOptions {
   runNtn?: NtnRunner;
+  signal?: AbortSignal;
+  spinner?: Pick<ReturnType<typeof p.spinner>, 'start' | 'stop'>;
   download?: (url: string) => Promise<DownloadedSource>;
 }
 
@@ -144,8 +151,9 @@ function parseDirectory(value: unknown, label: string): NotionDirectory {
   };
 }
 
-function downloadNotionDirectory(url: string): Promise<DownloadedSource> {
+function downloadNotionDirectory(url: string, signal?: AbortSignal): Promise<DownloadedSource> {
   return downloadSource(url, {
+    signal,
     downloadMaxBytes: NOTION_DOWNLOAD_MAX_BYTES,
     extractMaxBytes: NOTION_EXTRACT_MAX_BYTES,
     extractMaxFiles: NOTION_EXTRACT_MAX_FILES,
@@ -158,10 +166,11 @@ function debugNtn(args: string[]): void {
   }
 }
 
-export async function runNtnApi(args: string[]): Promise<string> {
+export async function runNtnApi(args: string[], signal?: AbortSignal): Promise<string> {
   debugNtn(args);
   return new Promise((resolve, reject) => {
     const child = spawn('ntn', args, {
+      signal,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -299,7 +308,7 @@ function inWorkspace(workspace: string | null): string {
 }
 
 export function isNotionSource(source: string): boolean {
-  return source.toLowerCase() === 'notion';
+  return /^notion(?::pack:[^:]+)?$/i.test(source);
 }
 
 const NOTION_HOSTNAME = /(^|\.)notion\.(so|com)$/;
@@ -357,14 +366,16 @@ export async function prepareNotionSkillSource(
   pageId: string,
   options: PrepareNotionSkillSourceOptions = {}
 ): Promise<PreparedNotionSkillSource> {
-  const download = options.download ?? downloadNotionDirectory;
-  const spinner = p.spinner();
+  const download =
+    options.download ?? ((url: string) => downloadNotionDirectory(url, options.signal));
+  const runNtn = options.runNtn ?? ((args: string[]) => runNtnApi(args, options.signal));
+  const spinner = options.spinner ?? p.spinner();
   spinner.start('Fetching Notion skill with ntn…');
 
   try {
     const [directory, workspace] = await Promise.all([
-      fetchNotionSkillDirectory(pageId, { runNtn: options.runNtn }),
-      fetchNotionWorkspaceName({ runNtn: options.runNtn }),
+      fetchNotionSkillDirectory(pageId, { runNtn }),
+      fetchNotionWorkspaceName({ runNtn }),
     ]);
     const downloaded = await download(directory.url);
     spinner.stop(`Downloaded skill from Notion${inWorkspace(workspace)}`);
@@ -406,16 +417,19 @@ function printAvailablePacks(packs: NotionPack[]): void {
 export async function prepareNotionPackSource(
   options: PrepareNotionPackSourceOptions = {}
 ): Promise<PreparedNotionPackSource | null> {
-  const spinner = p.spinner();
+  options.signal?.throwIfAborted();
+  const spinner = options.spinner ?? p.spinner();
+  const runNtn = options.runNtn ?? ((args: string[]) => runNtnApi(args, options.signal));
   spinner.start('Fetching Notion packs with ntn…');
 
   let packs: NotionPack[];
   let workspace: string | null = null;
   try {
     [packs, workspace] = await Promise.all([
-      fetchNotionPacks({ runNtn: options.runNtn }),
-      fetchNotionWorkspaceName({ runNtn: options.runNtn }),
+      fetchNotionPacks({ runNtn }),
+      fetchNotionWorkspaceName({ runNtn }),
     ]);
+    options.signal?.throwIfAborted();
   } catch (error) {
     spinner.stop(pc.red('Failed to load Notion packs'));
     throw error;
@@ -464,15 +478,18 @@ export async function prepareNotionPackSource(
     selectedPacks = selected as NotionPack[];
   }
 
-  p.note(
-    selectedPacks.map((pack) => pc.cyan(pack.name)).join('\n'),
-    `Selected ${selectedPacks.length} Notion pack${selectedPacks.length === 1 ? '' : 's'}`
-  );
+  if (!options.spinner)
+    p.note(
+      selectedPacks.map((pack) => pc.cyan(pack.name)).join('\n'),
+      `Selected ${selectedPacks.length} Notion pack${selectedPacks.length === 1 ? '' : 's'}`
+    );
 
   const stagingDir = await mkdtemp(join(tmpdir(), 'skills-notion-'));
   const packsDir = join(stagingDir, 'packs');
   const manifestPlugins: Array<{ name: string; source: string; skills: string[] }> = [];
-  const download = options.download ?? downloadNotionDirectory;
+  const replaySources: Array<{ path: string; source: string }> = [];
+  const download =
+    options.download ?? ((url: string) => downloadNotionDirectory(url, options.signal));
   const discover = options.discover ?? discoverSkills;
   let skillCount = 0;
 
@@ -483,12 +500,16 @@ export async function prepareNotionPackSource(
     for (const [index, pack] of selectedPacks.entries()) {
       let downloaded: DownloadedSource | null = null;
       try {
-        const directory = await fetchNotionPackDirectory(pack, { runNtn: options.runNtn });
+        options.signal?.throwIfAborted();
+        const directory = await fetchNotionPackDirectory(pack, { runNtn });
+        options.signal?.throwIfAborted();
         downloaded = await download(directory.url);
+        options.signal?.throwIfAborted();
         const skills = await discover(downloaded.rootDir, undefined, {
           includeInternal: true,
           fullDepth: true,
         });
+        options.signal?.throwIfAborted();
         if (skills.length === 0) {
           throw new Error('pack contains no valid skills');
         }
@@ -499,7 +520,13 @@ export async function prepareNotionPackSource(
           recursive: true,
           force: false,
           errorOnExist: true,
+          filter() {
+            options.signal?.throwIfAborted();
+            return true;
+          },
         });
+        options.signal?.throwIfAborted();
+        replaySources.push({ path: targetDir, source: `notion:pack:${pack.id}` });
 
         manifestPlugins.push({
           name: pack.name,
@@ -519,6 +546,7 @@ export async function prepareNotionPackSource(
     }
 
     const manifestDir = join(stagingDir, '.claude-plugin');
+    options.signal?.throwIfAborted();
     await mkdir(manifestDir, { recursive: true });
     await writeFile(
       join(manifestDir, 'marketplace.json'),
@@ -532,6 +560,7 @@ export async function prepareNotionPackSource(
       )}\n`,
       'utf8'
     );
+    options.signal?.throwIfAborted();
 
     spinner.stop(
       `Prepared ${pc.green(selectedPacks.length)} Notion pack${selectedPacks.length === 1 ? '' : 's'} with ${pc.green(skillCount)} skill${skillCount === 1 ? '' : 's'}`
@@ -541,6 +570,7 @@ export async function prepareNotionPackSource(
       tempDir: stagingDir,
       packCount: selectedPacks.length,
       skillCount,
+      replaySources,
     };
   } catch (error) {
     spinner.stop(pc.red('Failed to prepare Notion packs'));

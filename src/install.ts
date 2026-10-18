@@ -78,6 +78,8 @@ export async function runInstallFromLock(args: string[]): Promise<void> {
     const result = await installFromSource(parseSource(source), {
       skills,
       agents: universalAgentNames,
+      reason: 'explicit',
+      installSource: source,
     });
     if (result.error) {
       p.log.error(`Failed to install from ${pc.cyan(source)}: ${result.error}`);

@@ -66,9 +66,10 @@ async function cloneAtSha(
   url: string,
   sha: string,
   tempDir: string,
-  extraEnv?: NodeJS.ProcessEnv
+  extraEnv?: NodeJS.ProcessEnv,
+  signal?: AbortSignal
 ): Promise<void> {
-  const git = createGitClient(extraEnv);
+  const git = createGitClient(extraEnv, signal);
   await git.cwd(tempDir);
   await git.init();
   await git.addRemote('origin', url);
@@ -161,8 +162,9 @@ function isAuthFailure(message: string): boolean {
   );
 }
 
-function createGitClient(extraEnv?: NodeJS.ProcessEnv) {
+function createGitClient(extraEnv?: NodeJS.ProcessEnv, signal?: AbortSignal) {
   const git = simpleGit({
+    abort: signal,
     timeout: { block: CLONE_TIMEOUT_MS },
     // When git-lfs is NOT installed, GIT_LFS_SKIP_SMUDGE has no effect —
     // git sees `filter=lfs` in .gitattributes, tries to run
@@ -234,13 +236,19 @@ async function resetTempDir(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true });
 }
 
-async function tryGhClone(repo: GitHubRepoInfo, tempDir: string, ref?: string): Promise<boolean> {
+async function tryGhClone(
+  repo: GitHubRepoInfo,
+  tempDir: string,
+  ref?: string,
+  signal?: AbortSignal
+): Promise<boolean> {
   let cloneTarget = repo.slug;
   const host = repo.sshUrl.match(/^git@([^:]+):/)?.[1] || 'github.com';
 
   try {
     const { stdout, stderr } = await execFileAsync('gh', ['auth', 'status', '-h', host], {
       timeout: 5000,
+      signal,
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     });
     const statusOutput = `${stdout}${stderr}`;
@@ -254,6 +262,7 @@ async function tryGhClone(repo: GitHubRepoInfo, tempDir: string, ref?: string): 
   const gitFlags = ref ? ['--depth=1', '--branch', ref] : ['--depth=1'];
   await execFileAsync('gh', ['repo', 'clone', cloneTarget, tempDir, '--', ...gitFlags], {
     timeout: CLONE_TIMEOUT_MS,
+    signal,
     env: {
       ...process.env,
       GIT_TERMINAL_PROMPT: '0',
@@ -292,7 +301,8 @@ function buildGitHubAuthError(url: string, repo: GitHubRepoInfo | null, message:
   );
 }
 
-export async function cloneRepo(url: string, ref?: string): Promise<string> {
+export async function cloneRepo(url: string, ref?: string, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
   if (/^ext::/i.test(url)) {
     throw new GitCloneError('Unsupported Git transport: ext', url);
   }
@@ -303,7 +313,8 @@ export async function cloneRepo(url: string, ref?: string): Promise<string> {
   const repo = parseGitHubRepoUrl(url);
 
   try {
-    await createGitClient().clone(url, tempDir, cloneOptions);
+    await createGitClient(undefined, signal).clone(url, tempDir, cloneOptions);
+    signal?.throwIfAborted();
     return tempDir;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -312,10 +323,11 @@ export async function cloneRepo(url: string, ref?: string): Promise<string> {
     // the clone failed because the ref was not a branch or tag, retry by
     // fetching the commit directly. This runs only after `--branch` fails, so a
     // real branch or tag (any name) is always resolved first.
-    if (refCanBeSha && isMissingRefError(errorMessage)) {
+    if (!signal?.aborted && refCanBeSha && isMissingRefError(errorMessage)) {
       try {
         await resetTempDir(tempDir);
-        await cloneAtSha(url, ref!, tempDir);
+        await cloneAtSha(url, ref!, tempDir, undefined, signal);
+        signal?.throwIfAborted();
         return tempDir;
       } catch {
         // Fall through to the standard error handling below.
@@ -325,7 +337,7 @@ export async function cloneRepo(url: string, ref?: string): Promise<string> {
     const isTimeout = errorMessage.includes('block timeout') || errorMessage.includes('timed out');
     const isAuthError = isAuthFailure(errorMessage);
 
-    if (isTimeout) {
+    if (!signal?.aborted && isTimeout) {
       await rm(tempDir, { recursive: true, force: true }).catch(() => {});
       const seconds = Math.round(CLONE_TIMEOUT_MS / 1000);
       throw new GitCloneError(
@@ -341,10 +353,11 @@ export async function cloneRepo(url: string, ref?: string): Promise<string> {
       );
     }
 
-    if (isAuthError && repo && isGitHubHttpsCloneUrl(url)) {
+    if (!signal?.aborted && isAuthError && repo && isGitHubHttpsCloneUrl(url)) {
       try {
         await resetTempDir(tempDir);
-        if (await tryGhClone(repo, tempDir, ref)) {
+        if (await tryGhClone(repo, tempDir, ref, signal)) {
+          signal?.throwIfAborted();
           return tempDir;
         }
       } catch {
@@ -352,21 +365,23 @@ export async function cloneRepo(url: string, ref?: string): Promise<string> {
       }
 
       try {
+        signal?.throwIfAborted();
         await resetTempDir(tempDir);
         const sshEnv = {
           GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? 'ssh -o BatchMode=yes',
         };
         try {
-          await createGitClient(sshEnv).clone(repo.sshUrl, tempDir, cloneOptions);
+          await createGitClient(sshEnv, signal).clone(repo.sshUrl, tempDir, cloneOptions);
         } catch (sshError) {
           const sshMessage = sshError instanceof Error ? sshError.message : String(sshError);
-          if (refCanBeSha && isMissingRefError(sshMessage)) {
+          if (!signal?.aborted && refCanBeSha && isMissingRefError(sshMessage)) {
             await resetTempDir(tempDir);
-            await cloneAtSha(repo.sshUrl, ref!, tempDir, sshEnv);
+            await cloneAtSha(repo.sshUrl, ref!, tempDir, sshEnv, signal);
           } else {
             throw sshError;
           }
         }
+        signal?.throwIfAborted();
         return tempDir;
       } catch {
         // Fall through to the targeted auth error below.
@@ -374,6 +389,7 @@ export async function cloneRepo(url: string, ref?: string): Promise<string> {
     }
 
     await rm(tempDir, { recursive: true, force: true }).catch(() => {});
+    signal?.throwIfAborted();
 
     if (isAuthError) {
       throw new GitCloneError(buildGitHubAuthError(url, repo, errorMessage), url, false, true);

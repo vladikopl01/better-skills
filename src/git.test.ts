@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { rmSync } from 'fs';
+import { existsSync, rmSync } from 'fs';
 
 const simpleGitMock = vi.hoisted(() => vi.fn());
 const execFileMock = vi.hoisted(() => vi.fn());
@@ -84,6 +84,31 @@ describe('git clone fallbacks', () => {
     for (const dir of createdDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('aborts a clone, removes its temporary files, and skips authentication fallbacks', async () => {
+    const controller = new AbortController();
+    let directory = '';
+    const clone = vi.fn().mockImplementation((_url: string, path: string) => {
+      directory = path;
+      return new Promise((_resolve, reject) =>
+        controller.signal.addEventListener(
+          'abort',
+          () => reject(new Error('Authentication failed')),
+          { once: true }
+        )
+      );
+    });
+    simpleGitMock.mockReturnValue(createGitClientMock(clone));
+    const pending = cloneRepo('https://github.com/owner/repo.git', undefined, controller.signal);
+    await vi.waitFor(() => expect(clone).toHaveBeenCalled());
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(simpleGitMock).toHaveBeenCalledWith(
+      expect.objectContaining({ abort: controller.signal })
+    );
+    expect(execFileMock).not.toHaveBeenCalled();
+    expect(existsSync(directory)).toBe(false);
   });
 
   it('parses GitHub HTTPS and SSH clone URLs', () => {

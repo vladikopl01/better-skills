@@ -8,18 +8,20 @@ This file provides guidance to AI coding agents working on the `skills` CLI code
 
 ## Commands
 
-| Command                       | Description                                         |
-| ----------------------------- | --------------------------------------------------- |
-| `skills`                      | Show banner with available commands                 |
-| `skills add <pkg>`            | Install skills from git repos, URLs, or local paths |
-| `skills use <pkg>@<skill>`    | Use one skill without installing                    |
-| `skills experimental_install` | Restore skills from skills-lock.json                |
-| `skills experimental_sync`    | Sync skills from node_modules into agent dirs       |
-| `skills list`                 | List installed skills (alias: `ls`)                 |
-| `skills update [skills...]`   | Update skills to latest versions                    |
-| `skills init [name]`          | Create a new SKILL.md template                      |
+| Command                       | Description                                   |
+| ----------------------------- | --------------------------------------------- |
+| `skills`                      | Show banner with available commands           |
+| `skills add [pkg]`            | Install from a source, or browse skills       |
+| `skills like [pkg]`           | Like skills without installing them           |
+| `skills use <pkg>@<skill>`    | Use one skill without installing              |
+| `skills experimental_install` | Restore skills from skills-lock.json          |
+| `skills experimental_sync`    | Sync skills from node_modules into agent dirs |
+| `skills list`                 | List installed skills (alias: `ls`)           |
+| `skills list --saved`         | List saved skills, likes, and install counts  |
+| `skills update [skills...]`   | Update skills to latest versions              |
+| `skills init [name]`          | Create a new SKILL.md template                |
 
-Aliases: `skills a` works for `add`. `skills i`, `skills install` (no args) restore from `skills-lock.json`. `skills ls` works for `list`. `skills experimental_install` restores from `skills-lock.json`. `skills experimental_sync` crawls `node_modules` for skills.
+Aliases: `skills a`, `skills i`, and `skills install` use `add`. `skills ls` works for `list`. `skills experimental_install` restores from `skills-lock.json`. `skills experimental_sync` crawls `node_modules` for skills.
 
 ## Architecture
 
@@ -28,10 +30,16 @@ src/
 ├── cli.ts           # Main entry point, command routing, init/check/update
 ├── cli.test.ts      # CLI tests
 ├── add.ts           # Core add command logic
+├── add-saved.ts     # Shared settings and retries for source-less add selections
+├── add-source.ts    # Source preparation for saved selections, likes, and previews
+├── saved-skills.ts  # Likes, saved lists, and installation indicators
+├── personal-catalog.ts # Local likes, history, and atomic persistence
+├── personal-history.ts # Observe completed explicit installations
 ├── add-prompt.test.ts # Add prompt behavior tests
 ├── add.test.ts      # Add command tests
 ├── constants.ts      # Shared constants
 ├── find.ts           # Find/search command
+├── skills-api.ts    # Shared skills.sh search and all-time rankings
 ├── list.ts          # List installed skills command
 ├── list.test.ts     # List command tests
 ├── remove.ts         # Remove command implementation
@@ -48,7 +56,8 @@ src/
 ├── types.ts         # TypeScript types
 ├── plugin-manifest.ts # Plugin manifest discovery support
 ├── prompts/         # Interactive prompt helpers
-│   └── search-multiselect.ts
+│   ├── search-multiselect.ts
+│   └── skill-browser.ts # Source-less add: search, likes, and installation rankings
 ├── providers/       # Remote skill providers (GitHub, HuggingFace, Mintlify)
 │   ├── index.ts
 │   ├── registry.ts
@@ -74,6 +83,16 @@ tests/
 ├── xdg-config-paths.test.ts   # XDG global path handling tests
 └── dist.test.ts               # Tests for built distribution
 ```
+
+## Saved Skills
+
+Source-less `add` opens `prompts/skill-browser.ts`; `add <source>` keeps its existing flow. Both use the installation helpers in `add.ts`. Multi-source selections share one set of settings and retain successful targets on retry.
+
+Space toggles selection in every tab. Search uses 20-result pages navigated with Ctrl+P (previous) and Ctrl+N (next). Each tab retains its query and position; selection is keyed by source and skill across pages and searches.
+
+Likes and installation history are user-wide and start empty. Ecosystem counts from skills.sh are separate from personal counts. Count an explicit install once after all requested targets succeed and files are written; updates and dependency sync never count. Uninstall preserves metadata. Keep personal state separate from installation lockfiles and telemetry.
+
+Tests that install files must use temporary homes and projects through `createTestHomeEnvironment`; never use the developer's actual agent directories.
 
 ## Update Checking System
 

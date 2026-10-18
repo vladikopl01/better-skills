@@ -157,7 +157,7 @@ function truncateToWidth(text: string, width: number): string {
 }
 
 /**
- * Wrap description text into a fixed number of terminal-width-safe lines.
+ * Wrap description text into terminal-width-safe lines.
  * Empty lines are appended so changing the highlighted item never changes the
  * prompt's logical height.
  */
@@ -166,10 +166,17 @@ export function formatDetailLines(
   width: number,
   maxLines: number
 ): string[] {
-  const safeWidth = Math.max(1, width);
   const normalized = detail?.replace(/\s+/g, ' ').trim() ?? '';
+  const lines = wrapText(normalized, width, maxLines);
+  while (lines.length < maxLines) lines.push('');
+  return lines;
+}
+
+/** Wrap one paragraph, preserving indentation when displaying SKILL.md content. */
+export function wrapText(text: string, width: number, maxLines = Infinity): string[] {
+  const safeWidth = Math.max(1, width);
   const lines: string[] = [];
-  let remaining = normalized;
+  let remaining = text.replace(/\t/g, '  ');
 
   while (remaining && lines.length < maxLines) {
     if (approxStringWidth(remaining) <= safeWidth) {
@@ -179,6 +186,12 @@ export function formatDetailLines(
     }
 
     const candidate = truncateToWidth(remaining, safeWidth);
+    if (!candidate) {
+      // A wide character cannot fit in a one-cell terminal. Always make progress.
+      lines.push('…');
+      remaining = remaining.slice(remaining.codePointAt(0)! > 0xffff ? 2 : 1);
+      continue;
+    }
     const breakAt = candidate.lastIndexOf(' ');
     if (breakAt > 0) {
       lines.push(candidate.slice(0, breakAt).trimEnd());
@@ -194,7 +207,6 @@ export function formatDetailLines(
     lines[last] = `${truncateToWidth(lines[last]!, Math.max(0, safeWidth - 1)).trimEnd()}…`;
   }
 
-  while (lines.length < maxLines) lines.push('');
   return lines;
 }
 

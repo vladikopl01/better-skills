@@ -4,6 +4,9 @@ import { sanitizeMetadata } from './sanitize.ts';
 import { track } from './telemetry.ts';
 import { isRepoPrivate } from './source-parser.ts';
 import { isRunningInAgent } from './detect-agent.ts';
+import { fetchSkillResults, formatInstalls, type SearchSkill } from './skills-api.ts';
+
+export type { SearchSkill } from './skills-api.ts';
 
 const RESET = '\x1b[0m';
 const BOLD = '\x1b[1m';
@@ -12,24 +15,6 @@ const TEXT = '\x1b[38;5;145m';
 const CYAN = '\x1b[36m';
 const MAGENTA = '\x1b[35m';
 const YELLOW = '\x1b[33m';
-
-// API endpoint for skills search
-const SEARCH_API_BASE = process.env.SKILLS_API_URL || 'https://skills.sh';
-const SEARCH_RESULT_LIMIT = '20';
-
-function formatInstalls(count: number): string {
-  if (!count || count <= 0) return '';
-  if (count >= 1_000_000) return `${(count / 1_000_000).toFixed(1).replace(/\.0$/, '')}M installs`;
-  if (count >= 1_000) return `${(count / 1_000).toFixed(1).replace(/\.0$/, '')}K installs`;
-  return `${count} install${count === 1 ? '' : 's'}`;
-}
-
-export interface SearchSkill {
-  name: string;
-  slug: string;
-  source: string;
-  installs: number;
-}
 
 export interface FindOptions {
   owner?: string;
@@ -86,30 +71,8 @@ export function parseFindOptions(args: string[]): ParseFindOptionsResult {
 // Search via API
 export async function searchSkillsAPI(query: string, owner?: string): Promise<SearchSkill[]> {
   try {
-    const params = new URLSearchParams({ q: query, limit: SEARCH_RESULT_LIMIT });
-    if (owner) params.set('owner', owner);
-    const url = `${SEARCH_API_BASE}/api/search?${params.toString()}`;
-    const res = await fetch(url);
-
-    if (!res.ok) return [];
-
-    const data = (await res.json()) as {
-      skills: Array<{
-        id: string;
-        name: string;
-        installs: number;
-        source: string;
-      }>;
-    };
-
-    return data.skills
-      .map((skill) => ({
-        name: sanitizeMetadata(skill.name),
-        slug: sanitizeMetadata(skill.id),
-        source: sanitizeMetadata(skill.source || ''),
-        installs: skill.installs,
-      }))
-      .sort((a, b) => (b.installs || 0) - (a.installs || 0));
+    const skills = await fetchSkillResults(query, { owner });
+    return skills.map(({ name, slug, source, installs }) => ({ name, slug, source, installs }));
   } catch {
     return [];
   }
