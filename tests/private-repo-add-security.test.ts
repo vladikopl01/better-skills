@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile, execSync } from 'node:child_process';
+import { createTestHomeEnvironment } from '../src/test-utils.ts';
 
 vi.mock('node:child_process', async (importActual) => {
   const actual = await importActual<typeof import('node:child_process')>();
@@ -66,6 +67,9 @@ describe('private repository installs', () => {
 
   beforeEach(async () => {
     base = await mkdtemp(join(tmpdir(), 'private-repo-add-'));
+    for (const [name, value] of Object.entries(createTestHomeEnvironment(join(base, 'home')))) {
+      vi.stubEnv(name, value);
+    }
     fixture = join(base, 'fixture');
     project = join(base, 'project');
     await mkdir(fixture, { recursive: true });
@@ -107,6 +111,7 @@ describe('private repository installs', () => {
     if (originalDoNotTrack === undefined) delete process.env.DO_NOT_TRACK;
     else process.env.DO_NOT_TRACK = originalDoNotTrack;
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     await rm(base, { recursive: true, force: true });
   });
 

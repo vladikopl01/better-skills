@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createTestHomeEnvironment } from '../src/test-utils.ts';
 
 const { spinnerStart, spinnerStop, spinnerMessage } = vi.hoisted(() => ({
   spinnerStart: vi.fn(),
@@ -78,6 +79,9 @@ describe('blob clone fallback output', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     base = await mkdtemp(join(tmpdir(), 'blob-fallback-'));
+    for (const [name, value] of Object.entries(createTestHomeEnvironment(join(base, 'home')))) {
+      vi.stubEnv(name, value);
+    }
     fixture = join(base, 'fixture');
     project = join(base, 'project');
     await mkdir(join(fixture, 'skill'), { recursive: true });
@@ -93,6 +97,7 @@ describe('blob clone fallback output', () => {
 
   afterEach(async () => {
     process.chdir(originalCwd);
+    vi.unstubAllEnvs();
     await rm(base, { recursive: true, force: true });
   });
 

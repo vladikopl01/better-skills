@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createTestHomeEnvironment } from '../src/test-utils.ts';
 
 // Isolate side-effecting UI / network deps so runAdd can run headless in CI.
 vi.mock('@clack/prompts', () => {
@@ -107,6 +108,9 @@ describe('root-level lock hash covers the whole directory (issue #1603)', () => 
 
   beforeEach(async () => {
     base = await mkdtemp(join(tmpdir(), 'root-hash-'));
+    for (const [name, value] of Object.entries(createTestHomeEnvironment(join(base, 'home')))) {
+      vi.stubEnv(name, value);
+    }
     origCwd = process.cwd();
     vi.spyOn(process, 'exit').mockImplementation((() => {
       throw new Error('process.exit called');
@@ -117,6 +121,7 @@ describe('root-level lock hash covers the whole directory (issue #1603)', () => 
     process.chdir(origCwd);
     await rm(base, { recursive: true, force: true });
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('changing a supporting file (scripts/) changes the computed lock hash', async () => {

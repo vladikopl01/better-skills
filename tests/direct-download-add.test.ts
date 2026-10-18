@@ -5,6 +5,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { gzipSync } from 'node:zlib';
+import { createTestHomeEnvironment } from '../src/test-utils.ts';
 
 vi.mock('@clack/prompts', () => {
   const noop = () => {};
@@ -115,6 +116,9 @@ describe('direct download add', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     project = await mkdtemp(join(tmpdir(), 'direct-download-add-'));
+    for (const [name, value] of Object.entries(createTestHomeEnvironment(join(project, 'home')))) {
+      vi.stubEnv(name, value);
+    }
     originalCwd = process.cwd();
     process.chdir(project);
     vi.spyOn(process, 'exit').mockImplementation((() => {
@@ -125,6 +129,7 @@ describe('direct download add', () => {
   afterEach(async () => {
     process.chdir(originalCwd);
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     await rm(project, { recursive: true, force: true });
   });
 

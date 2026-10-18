@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, mkdir, writeFile, rm, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createTestHomeEnvironment } from '../src/test-utils.ts';
 
 // Isolate side-effecting UI / network deps so runAdd can run headless in CI.
 vi.mock('@clack/prompts', () => {
@@ -99,6 +100,9 @@ describe('root-level disk install (issue #1603)', () => {
 
   beforeEach(async () => {
     base = await mkdtemp(join(tmpdir(), 'root-disk-'));
+    for (const [name, value] of Object.entries(createTestHomeEnvironment(join(base, 'home')))) {
+      vi.stubEnv(name, value);
+    }
     fixture = join(base, 'fixture-repo');
     await mkdir(fixture, { recursive: true });
     await writeFile(
@@ -129,6 +133,7 @@ describe('root-level disk install (issue #1603)', () => {
     process.chdir(origCwd);
     await rm(base, { recursive: true, force: true });
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('installs the full directory (scripts/ + references/) for a root-level SKILL.md repo', async () => {
